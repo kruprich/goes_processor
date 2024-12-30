@@ -73,7 +73,7 @@ async def process_worker(process_queue, fields, lat_bounds, lon_bounds, accumula
             print(f"Processing error: {e}")
         process_queue.task_done()
 
-def generate_prefixes(start_date, end_date, product):
+def generate_prefixes(start_date, end_date):
     """Generate GCS prefixes for the given date range."""
     start_dt = datetime.strptime(start_date, '%Y-%m-%d')
     end_dt = datetime.strptime(end_date, '%Y-%m-%d')
@@ -81,7 +81,7 @@ def generate_prefixes(start_date, end_date, product):
     while start_dt <= end_dt:
         year = start_dt.year
         julian_day = start_dt.strftime('%j')
-        prefixes.append(f"{product}/{year}/{julian_day}/")
+        prefixes.append(f"GLM-L2-LCFA/{year}/{julian_day}/")
         start_dt += timedelta(days=1)
     return prefixes
 
@@ -136,17 +136,13 @@ async def main_async(bucket_name, prefixes, fields, lat_bounds, lon_bounds):
 
 def main():
     bucket_name = "gcp-public-data-goes-16"
-    product = "GLM-L2-LCFA"
     start_date = "2024-01-01"
     end_date = "2024-01-02"
     fields = ['flash_id', 'flash_time_offset_of_first_event', 'product_time', 'flash_lat', 'flash_lon', 'flash_quality_flag', 'flash_energy']
-    #placeholders
-    lat_name = ""
-    lon_name = ""
     lat_bounds = [0, 55]
     lon_bounds = [-135, -45]
 
-    prefixes = generate_prefixes(start_date, end_date, product)
+    prefixes = generate_prefixes(start_date, end_date)
 
     loop = asyncio.get_event_loop()
     result_df = loop.run_until_complete(main_async(bucket_name, prefixes, fields, lat_bounds, lon_bounds))
