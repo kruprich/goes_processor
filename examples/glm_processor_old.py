@@ -75,6 +75,7 @@ async def process_worker(process_queue, fields, lat_bounds, lon_bounds, accumula
 
 def generate_prefixes(start_date, end_date):
     """Generate GCS prefixes for the given date range."""
+    print('start generating prefixes')
     start_dt = datetime.strptime(start_date, '%Y-%m-%d')
     end_dt = datetime.strptime(end_date, '%Y-%m-%d')
     prefixes = []
@@ -83,6 +84,7 @@ def generate_prefixes(start_date, end_date):
         julian_day = start_dt.strftime('%j')
         prefixes.append(f"GLM-L2-LCFA/{year}/{julian_day}/")
         start_dt += timedelta(days=1)
+        print('done generating prefixes')
     return prefixes
 
 async def print_progress(download_counter, process_counter, error_counter, total_files):

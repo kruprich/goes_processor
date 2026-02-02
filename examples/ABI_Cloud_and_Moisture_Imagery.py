@@ -1,341 +1,439 @@
-from datetime import datetime, timedelta
-import os
-import sys
 import asyncio
 import aiohttp
-import numpy as np
-from io import BytesIO
-from multiprocessing import Value, Lock
 from google.cloud import storage
+from datetime import datetime, timedelta
 import pandas as pd
-import nest_asyncio
-import netCDF4 as nc
-from pyproj import Proj
-import xarray as xr
+import sys
+import contextlib
+import os
+from concurrent.futures import ProcessPoolExecutor
 
-# Apply this only in environments like Colab where an event loop may already be running
-nest_asyncio.apply()
-
-# Constants
+# ----------------------------
+# Config
+# ----------------------------
 RETRIES = 3
-MAX_CONCURRENT_DOWNLOADS = 16
-MAX_CONCURRENT_CONNECTIONS = MAX_CONCURRENT_DOWNLOADS * 2
-TIMEOUT_SECONDS = 30
-PREFETCH_THREADS = 1
-PROCESS_THREADS = 4
+MAX_DOWNLOAD_CONCURRENCY = 64
 
-# Initialize Google Cloud Storage client (Anonymous Access)
+# Bounded listing queue so blob-name buffer can't grow without bound
+LIST_QUEUE_MAXSIZE = 5000  # tune: 2k–20k
+
+# For macOS + netCDF4, use processes (NOT threads) for parsing
+MAX_PROCESS_WORKERS = 8
+
+TIMEOUT_SECONDS = 30
+PROCESS_QUEUE_MAXSIZE = MAX_DOWNLOAD_CONCURRENCY * 2
+
+# CSV flushing config (frames-only; NO time-based flush)
+OUTPUT_CSV_PATH = "filtered_data.csv"
+CSV_FLUSH_EVERY_FRAMES = 500
+
+# J2000 epoch used by GOES-R time fields (seconds since 2000-01-01 12:00:00 UTC)
+J2000_EPOCH = pd.Timestamp("2000-01-01 12:00:00")  # UTC-naive timestamp for CSV
+
 client = storage.Client.create_anonymous_client()
 
-async def download_blob_to_memory_async(bucket_name, blob_name, session, retries=RETRIES):
-    url = f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
-    for attempt in range(retries):
+
+# ----------------------------
+# Date prefixes
+# ----------------------------
+def generate_prefixes(start_date: str, end_date: str) -> list[str]:
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+    prefixes = []
+    while start_dt <= end_dt:
+        year = start_dt.year
+        julian_day = start_dt.strftime("%j")
+        prefixes.append(f"GLM-L2-LCFA/{year}/{julian_day}/")
+        start_dt += timedelta(days=1)
+    return prefixes
+
+
+# ----------------------------
+# Download
+# ----------------------------
+async def download_blob_bytes(session: aiohttp.ClientSession, url: str, retries: int = RETRIES) -> bytes | None:
+    timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
+    last_err = None
+
+    for attempt in range(1, retries + 1):
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)) as response:
-                if response.status == 200:
-                    file_data = await response.read()
-                    return BytesIO(file_data), len(file_data)
-                print(f"Retry {attempt+1}/{retries} failed for {blob_name}: Status {response.status}")
-        except (asyncio.TimeoutError, Exception) as e:
-            print(f"Error on attempt {attempt+1} for {blob_name}: {e}")
-    return None, 0
+            async with session.get(url, timeout=timeout) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+                last_err = f"HTTP {resp.status}"
+        except Exception as e:
+            last_err = repr(e)
 
-async def producer_download(bucket_name, download_queue, process_queue, session, download_counter, download_error_counter, downloaded_size, downloaded_size_lock):
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+        await asyncio.sleep(min(0.25 * attempt, 1.0))
 
-    async def download_task(blob_name):
-        async with semaphore:
-            file_data, file_size = await download_blob_to_memory_async(bucket_name, blob_name, session)
-            if file_data:
-                await process_queue.put(file_data)
-                with download_counter.get_lock():
-                    download_counter.value += 1
-                with downloaded_size_lock:
-                    downloaded_size.value += file_size
+    print(f"Download failed: {url} ({last_err})")
+    return None
+
+
+async def list_blobs_producer(bucket_name: str, prefixes: list[str], download_queue: asyncio.Queue, counters: dict):
+    """
+    Lists blob names and enqueues them WITH a monotonically increasing seq.
+    The queue is bounded, so listing backpressures naturally.
+    """
+    loop = asyncio.get_running_loop()
+
+    async def _enqueue(seq: int, name: str):
+        await download_queue.put((seq, name))
+        counters["listed"] += 1
+
+    def _thread_list():
+        try:
+            bucket = client.bucket(bucket_name)
+            seq = 0
+            for prefix in prefixes:
+                for blob in bucket.list_blobs(prefix=prefix):
+                    asyncio.run_coroutine_threadsafe(_enqueue(seq, blob.name), loop).result()
+                    seq += 1
+        except Exception as e:
+            asyncio.run_coroutine_threadsafe(download_queue.put(("__LIST_ERROR__", repr(e))), loop).result()
+
+    await asyncio.to_thread(_thread_list)
+
+
+async def download_worker(bucket_name: str, download_queue: asyncio.Queue, process_queue: asyncio.Queue,
+                          session: aiohttp.ClientSession, counters: dict):
+    while True:
+        item = await download_queue.get()
+        try:
+            if item is None:
+                return
+
+            if isinstance(item, tuple) and item and item[0] == "__LIST_ERROR__":
+                counters["list_errors"] += 1
+                print(f"\nListing error: {item[1]}")
+                return
+
+            seq, blob_name = item
+            url = f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
+            payload = await download_blob_bytes(session, url)
+
+            if payload is None:
+                counters["download_errors"] += 1
+                # still emit a placeholder so ordered writer can advance
+                await process_queue.put((seq, None))
             else:
-                with download_error_counter.get_lock():
-                    download_error_counter.value += 1
+                await process_queue.put((seq, payload))
+                counters["downloaded"] += 1
+        finally:
+            download_queue.task_done()
 
-    tasks = []
-    while True:
-        blob_name = await download_queue.get()
-        if blob_name is None:
-            break
-        tasks.append(asyncio.create_task(download_task(blob_name)))
-        download_queue.task_done()
 
-    await asyncio.gather(*tasks)
-    await process_queue.put("DONE")
+# ----------------------------
+# NetCDF parsing + filtering (RUNS IN A SEPARATE PROCESS)
+# ----------------------------
+def parse_and_filter_netcdf(payload: bytes,
+                            fields: list[str],
+                            lat_bounds: tuple[float, float],
+                            lon_bounds: tuple[float, float],
+                            quality_max: int) -> pd.DataFrame | None:
+    import netCDF4 as nc
+    import pandas as pd
 
-async def consumer_process(fields, lat_bounds, lon_bounds, process_queue, accumulated_data, process_counter, download_error_counter, out_of_range_counter, filtered_size, process_semaphore):
-    async def process_task(file_data):
-        nonlocal accumulated_data
-        async with process_semaphore:
-            accumulated_data, processed_bytes = process_single_file(file_data, fields, lat_bounds, lon_bounds, accumulated_data, process_counter, download_error_counter, out_of_range_counter)
-            with filtered_size.get_lock():
-                filtered_size.value += processed_bytes
-
-    tasks = []
-    while True:
-        file_data = await process_queue.get()
-        if file_data == "DONE": break
-        tasks.append(asyncio.create_task(process_task(file_data)))
-        process_queue.task_done()
-
-    await asyncio.gather(*tasks)
-    return accumulated_data
-
-def generate_julian_days(start_date, end_date):
-    start_dt = datetime.strptime(start_date, '%Y-%m-%d')
-    return [(start_dt + timedelta(days=i)).strftime('%j') for i in range((datetime.strptime(end_date, '%Y-%m-%d') - start_dt).days + 1)]
-
-def process_single_file(file_obj, fields, lat_bounds, lon_bounds, accumulated_data, process_counter, download_error_counter, out_of_range_counter):
-    processed_bytes = 0
     try:
-        # Step 1: Open the NetCDF file using netCDF4 from the BytesIO object
-        with nc.Dataset('in_memory.nc', mode='r', memory=file_obj.read()) as ds:
-            # Step 2: Extract the projection information
-            goes_proj = ds['goes_imager_projection']
-            x = ds['x'][:]
-            y = ds['y'][:]
+        with nc.Dataset("inmem", mode="r", memory=payload) as ds:
+            data = {}
+            lengths = []
 
-            # Projection information from GOES-R ABI fixed grid
-            sat_height = goes_proj.perspective_point_height
-            long_proj_origin = goes_proj.longitude_of_projection_origin
-            semi_major_axis = goes_proj.semi_major_axis
-            semi_minor_axis = goes_proj.semi_minor_axis
+            for field in fields:
+                if field in ds.variables:
+                    arr = ds.variables[field][:]
+                    data[field] = arr
+                    try:
+                        lengths.append(len(arr))
+                    except TypeError:
+                        lengths.append(None)
 
-            # Step 3: Create a projection object using pyproj
-            proj = Proj(proj='geos', h=sat_height, lon_0=long_proj_origin, 
-                        a=semi_major_axis, b=semi_minor_axis)
+            if not data:
+                return None
 
-            # Step 4: Convert projection coordinates to latitude and longitude
-            x_mesh, y_mesh = np.meshgrid(x, y)
-            lon, lat = proj(x_mesh, y_mesh, inverse=True)
+            clean_lengths = [l for l in lengths if l is not None]
+            if clean_lengths and len(set(clean_lengths)) != 1:
+                return None
 
-            # Step 5: Extract relevant fields (TPW, DQF) from the dataset
-            tpw_raw = ds['TPW'][:]
-            dqf = ds['DQF_Overall'][:]  # Assuming DQF field name here
-
-            # Step 6: Apply scale factor and offset to TPW
-            tpw_scale_factor = ds['TPW'].scale_factor
-            tpw_add_offset = ds['TPW'].add_offset
-            tpw = (tpw_raw * tpw_scale_factor) + tpw_add_offset
-
-            # Create a pandas DataFrame from the extracted data
-            df = pd.DataFrame({
-                'lat': lat.flatten(),
-                'lon': lon.flatten(),
-                'TPW': tpw.flatten(),
-                'DQF': dqf.flatten()
-            })
-
+            df = pd.DataFrame(data)
             if df.empty:
-                with download_error_counter.get_lock():
-                    download_error_counter.value += 1
+                return None
 
-            # Step 6: Apply the filtering based on lat/lon and quality flag
-            filtered_df = df.loc[
-                (df['lat'] >= lat_bounds[0]) & (df['lat'] <= lat_bounds[1]) &
-                (df['lon'] >= lon_bounds[0]) & (df['lon'] <= lon_bounds[1]) &
-                (df['DQF'] == 0)  # Only include good-quality data
-            ].copy()
+            # Add product_time_offset = J2000 epoch + product_time seconds
+            if "product_time" in df.columns:
+                df["product_time_offset"] = J2000_EPOCH + pd.to_timedelta(df["product_time"], unit="s")
 
-            if filtered_df.empty:
-                with out_of_range_counter.get_lock():
-                    out_of_range_counter.value += 1
-                return accumulated_data, processed_bytes
+            if "flash_lat" not in df.columns or "flash_lon" not in df.columns:
+                return None
 
-            # Step 7: Calculate the midpoint of `time_bounds` and assign it to all rows
-            time_bounds = ds['time_bounds'][:]
-            time_midpoint = np.mean(time_bounds)
+            mask = (
+                (df["flash_lat"] >= lat_bounds[0]) & (df["flash_lat"] <= lat_bounds[1]) &
+                (df["flash_lon"] >= lon_bounds[0]) & (df["flash_lon"] <= lon_bounds[1])
+            )
 
-            # Convert the midpoint time to datetime
-            reference_time = datetime(2000, 1, 1, 12, 0, 0)
-            midpoint_time = pd.to_datetime(time_midpoint, unit='s', origin=reference_time)
+            if "flash_quality_flag" in df.columns:
+                mask &= (df["flash_quality_flag"] <= quality_max)
 
-            # Step 8: Add the midpoint time to the filtered DataFrame
-            filtered_df['time'] = midpoint_time
+            filtered = df.loc[mask]
+            if filtered.empty:
+                return None
 
-            # Step 9: Select only the required columns: lat, lon, TPW, DQF, and time
-            filtered_df = filtered_df[['lat', 'lon', 'TPW', 'time', 'DQF']]
+            # Per-file sort by product_time ONLY
+            if "product_time" in filtered.columns:
+                filtered = filtered.sort_values(["product_time"], kind="mergesort").reset_index(drop=True)
 
-            # Step 10: Convert DataFrame back to numpy and concatenate with accumulated data
-            filtered_data = filtered_df.to_numpy()
-            accumulated_data = filtered_data if accumulated_data is None else np.vstack((accumulated_data, filtered_data))
+            return filtered
 
-            # Track the number of processed bytes
-            processed_bytes = filtered_data.nbytes
+    except Exception:
+        return None
 
-            # Step 11: Increment the process counter
-            with process_counter.get_lock():
-                process_counter.value += 1
 
-            return accumulated_data, processed_bytes
-
-    except Exception as e:
-        print(f"Error processing file: {e}")
-        return accumulated_data, processed_bytes
-
-async def prefetch_files_to_queue(bucket_name, prefixes, download_queue, total_files_counter, prefetch_semaphore):
-    async def prefetch_task(prefix):
-        bucket = client.bucket(bucket_name)
-        async with prefetch_semaphore:
-            blobs = list(bucket.list_blobs(prefix=prefix))
-            for blob in blobs:
-                await download_queue.put(blob.name)
-                with total_files_counter.get_lock():
-                    total_files_counter.value += 1
-
-    prefetch_tasks = [asyncio.create_task(prefetch_task(prefix)) for prefix in prefixes]
-
-    await asyncio.gather(*prefetch_tasks)
-    await download_queue.put(None)
-
-async def print_stats(download_counter, process_counter, download_error_counter, out_of_range_counter, total_files_counter, filtered_size, downloaded_size):
-    last_download_count = 0
-    last_process_count = 0
-    last_downloaded_size = 0
-    start_time = datetime.now()
+async def process_consumer(process_queue: asyncio.Queue,
+                           out_queue: asyncio.Queue,
+                           pool: ProcessPoolExecutor,
+                           fields: list[str],
+                           lat_bounds: tuple[float, float],
+                           lon_bounds: tuple[float, float],
+                           quality_max: int,
+                           counters: dict):
+    """
+    Consumes (seq, payload) and emits (seq, df_or_none) for EVERY seq.
+    Required so ordered writer can always advance.
+    """
+    loop = asyncio.get_running_loop()
 
     while True:
-        await asyncio.sleep(1)
-        current_time = datetime.now()
-        elapsed_time = 1
+        item = await process_queue.get()
+        try:
+            if item is None:
+                return
 
-        download_rate = (download_counter.value - last_download_count) / elapsed_time
-        process_rate = (process_counter.value - last_process_count) / elapsed_time
-        download_speed = (downloaded_size.value - last_downloaded_size) / elapsed_time / 1e6
-        files_left = total_files_counter.value - process_counter.value
-        time_to_completion = files_left / process_rate if process_rate > 0 else float('inf')
+            seq, payload = item
 
-        if time_to_completion == float('inf'):
-            formatted_time_to_completion = "∞"
-        else:
-            hours, remainder = divmod(int(time_to_completion), 3600)
-            minutes, seconds = divmod(remainder, 60)
-            formatted_time_to_completion = f"{hours:02}:{minutes:02}:{seconds:02}"
+            if payload is None:
+                counters["processed_empty_or_filtered"] += 1
+                await out_queue.put((seq, None))
+                continue
 
-        total_elapsed_time = (current_time - start_time).total_seconds()
-        elapsed_hours, elapsed_remainder = divmod(int(total_elapsed_time), 3600)
-        elapsed_minutes, elapsed_seconds = divmod(elapsed_remainder, 60)
-        formatted_elapsed_time = f"{elapsed_hours:02}:{elapsed_minutes:02}:{elapsed_seconds:02}"
+            df = await loop.run_in_executor(
+                pool,
+                parse_and_filter_netcdf,
+                payload,
+                fields,
+                lat_bounds,
+                lon_bounds,
+                quality_max,
+            )
 
-        last_download_count = download_counter.value
-        last_process_count = process_counter.value
-        last_downloaded_size = downloaded_size.value
+            if df is None:
+                counters["processed_empty_or_filtered"] += 1
+                await out_queue.put((seq, None))
+            else:
+                counters["processed_ok"] += 1
+                await out_queue.put((seq, df))
 
-        status_message = (
-            f"Elapsed Time:       {formatted_elapsed_time}\n"
-            f"Downloaded Files:   {download_counter.value}/{total_files_counter.value} | {download_rate:.2f} files/sec | {download_speed:.2f} MB/s | Time Remaining: {formatted_time_to_completion}\n"
-            f"Processed Files:    {process_counter.value}/{total_files_counter.value} | {process_rate:.2f} files/sec | Errors: {download_error_counter.value} | Out of Range: {out_of_range_counter.value}\n"
+        except Exception as e:
+            counters["process_errors"] += 1
+            print(f"\nProcess error: {e}")
+            # Emit drop to avoid stalling ordering
+            try:
+                if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], int):
+                    await out_queue.put((item[0], None))
+            except Exception:
+                pass
+        finally:
+            process_queue.task_done()
+
+
+# ----------------------------
+# ORDERED CSV writer (frames-only flush; NO time-based flush)
+# ----------------------------
+async def csv_writer_ordered(
+    out_queue: asyncio.Queue,
+    counters: dict,
+    output_csv_path: str,
+    flush_every_frames: int = CSV_FLUSH_EVERY_FRAMES,
+) -> None:
+    """
+    Ordered writer:
+      - buffers out-of-order (seq, df_or_none) results
+      - writes ONLY when next_seq is available
+      - guarantees the CSV is appended in file order (seq order)
+    """
+    pending: dict[int, pd.DataFrame | None] = {}
+    next_seq = 0
+
+    buffer: list[pd.DataFrame] = []
+    header_written = os.path.exists(output_csv_path) and os.path.getsize(output_csv_path) > 0
+
+    def _flush_sync():
+        nonlocal buffer, header_written
+        if not buffer:
+            return
+        df_out = pd.concat(buffer, ignore_index=True)
+        df_out.to_csv(output_csv_path, mode="a", index=False, header=not header_written)
+        header_written = True
+        counters["frames_flushed"] += len(buffer)
+        counters["rows_written"] += len(df_out)
+        buffer = []
+
+    def _maybe_buffer(df: pd.DataFrame | None):
+        if df is None or df.empty:
+            return
+        buffer.append(df)
+        counters["frames_collected"] += 1
+        if len(buffer) >= flush_every_frames:
+            _flush_sync()
+
+    while True:
+        item = await out_queue.get()
+        try:
+            if item is None:
+                while next_seq in pending:
+                    _maybe_buffer(pending.pop(next_seq))
+                    next_seq += 1
+                _flush_sync()
+                return
+
+            seq, df = item
+            pending[seq] = df
+
+            while next_seq in pending:
+                _maybe_buffer(pending.pop(next_seq))
+                next_seq += 1
+
+        finally:
+            out_queue.task_done()
+
+
+async def print_progress(counters: dict):
+    while True:
+        sys.stdout.write(
+            "\r"
+            f"listed={counters['listed']}  "
+            f"downloaded={counters['downloaded']}  "
+            f"dl_err={counters['download_errors']}  "
+            f"proc_ok={counters['processed_ok']}  "
+            f"proc_drop={counters['processed_empty_or_filtered']}  "
+            f"proc_err={counters['process_errors']}  "
+            f"frames_in={counters['frames_collected']}  "
+            f"frames_flushed={counters['frames_flushed']}  "
+            f"rows_written={counters['rows_written']}  "
         )
-
-        sys.stdout.write("\033[F" * (status_message.count("\n")) + "\033[K")
-        sys.stdout.write(status_message)
         sys.stdout.flush()
+        await asyncio.sleep(0.5)
 
-async def main_async(bucket_name, prefixes, fields_to_extract, lat_bounds, lon_bounds):
-    download_queue = asyncio.Queue()
-    process_queue = asyncio.Queue()
-    counters = [Value('i', 0) for _ in range(7)]
-    download_counter, process_counter, download_error_counter, out_of_range_counter, total_files_counter, filtered_size, downloaded_size = counters
-    downloaded_size_lock = Lock()
-    accumulated_data = None
 
-    prefetch_semaphore = asyncio.Semaphore(PREFETCH_THREADS)
-    process_semaphore = asyncio.Semaphore(PROCESS_THREADS)
+# ----------------------------
+# Pipeline
+# ----------------------------
+async def main_async(bucket_name: str,
+                     prefixes: list[str],
+                     fields: list[str],
+                     lat_bounds: tuple[float, float],
+                     lon_bounds: tuple[float, float],
+                     quality_max: int = 1,
+                     output_csv_path: str = OUTPUT_CSV_PATH) -> str:
 
-    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_CONNECTIONS, limit_per_host=MAX_CONCURRENT_DOWNLOADS, keepalive_timeout=60)
+    download_queue = asyncio.Queue(maxsize=LIST_QUEUE_MAXSIZE)
+    process_queue = asyncio.Queue(maxsize=PROCESS_QUEUE_MAXSIZE)
+    out_queue = asyncio.Queue()
+
+    if os.path.exists(output_csv_path):
+        os.remove(output_csv_path)
+
+    counters = {
+        "listed": 0,
+        "list_errors": 0,
+        "downloaded": 0,
+        "download_errors": 0,
+        "processed_ok": 0,
+        "processed_empty_or_filtered": 0,
+        "process_errors": 0,
+        "frames_collected": 0,
+        "frames_flushed": 0,
+        "rows_written": 0,
+    }
+
+    progress_task = asyncio.create_task(print_progress(counters))
+    writer_task = asyncio.create_task(csv_writer_ordered(out_queue, counters, output_csv_path))
+
+    connector = aiohttp.TCPConnector(limit=MAX_DOWNLOAD_CONCURRENCY)
     async with aiohttp.ClientSession(connector=connector) as session:
-        stats_task = asyncio.create_task(print_stats(download_counter, process_counter, download_error_counter, out_of_range_counter, total_files_counter, filtered_size, downloaded_size))
-        prefetch_task = asyncio.create_task(prefetch_files_to_queue(bucket_name, prefixes, download_queue, total_files_counter, prefetch_semaphore))
-        producer_task = asyncio.create_task(producer_download(bucket_name, download_queue, process_queue, session, download_counter, download_error_counter, downloaded_size, downloaded_size_lock))
-        consumer_task = asyncio.create_task(consumer_process(fields_to_extract, lat_bounds, lon_bounds, process_queue, accumulated_data, process_counter, download_error_counter, out_of_range_counter, filtered_size, process_semaphore))
+        producer_task = asyncio.create_task(list_blobs_producer(bucket_name, prefixes, download_queue, counters))
 
-        await asyncio.gather(prefetch_task, producer_task, consumer_task)
-        stats_task.cancel()
+        download_tasks = [
+            asyncio.create_task(download_worker(bucket_name, download_queue, process_queue, session, counters))
+            for _ in range(MAX_DOWNLOAD_CONCURRENCY)
+        ]
 
-    return await consumer_task
+        with ProcessPoolExecutor(max_workers=MAX_PROCESS_WORKERS) as pool:
+            process_consumers = [
+                asyncio.create_task(
+                    process_consumer(process_queue, out_queue, pool, fields, lat_bounds, lon_bounds, quality_max, counters)
+                )
+                for _ in range(min(MAX_PROCESS_WORKERS, 8))
+            ]
 
-def aggregate_over_time_and_grid(accumulated_data, lat_bounds, lon_bounds):
-    # Create a pandas DataFrame from accumulated data
-    df = pd.DataFrame(accumulated_data, columns=['lat', 'lon', 'TPW', 'time', 'DQF'])
+            await producer_task
 
-    # Convert 'time' to datetime and handle any missing or NaT values
-    df['time'] = pd.to_datetime(df['time'], errors='coerce')
-    df = df.dropna(subset=['time'])  # Drop rows where 'time' is NaT
+            for _ in range(MAX_DOWNLOAD_CONCURRENCY):
+                await download_queue.put(None)
 
-    # Align 'time' to 00:00:00 of the day and ensure it starts at the beginning of the day
-    df['time'] = df['time'].dt.floor('D') + pd.to_timedelta((df['time'].dt.hour * 60 + df['time'].dt.minute) // 30 * 30, unit='m')
+            await download_queue.join()
+            await asyncio.gather(*download_tasks)
 
-    # Resample the data into 30-minute intervals starting from 00:00:00 using 'min' instead of 'T'
-    df = df.set_index('time').resample('30min').mean().reset_index()
+            for _ in range(len(process_consumers)):
+                await process_queue.put(None)
 
-    # Create a grid of 10km resolution (no meshgrid needed)
-    lat_grid = np.arange(lat_bounds[0], lat_bounds[1], 0.1)  # Roughly 10km at the equator
-    lon_grid = np.arange(lon_bounds[0], lon_bounds[1], 0.1)
+            await process_queue.join()
+            await asyncio.gather(*process_consumers)
 
-    # Assign each point to the nearest grid point
-    df['lat_grid'] = np.digitize(df['lat'], lat_grid) - 1
-    df['lon_grid'] = np.digitize(df['lon'], lon_grid) - 1
-    df['lat_grid'] = lat_grid[df['lat_grid']]
-    df['lon_grid'] = lon_grid[df['lon_grid']]
+    await out_queue.put(None)
+    await out_queue.join()
+    await writer_task
 
-    # Group by the grid points and time, take the mean of TPW values
-    aggregated_df = df.groupby(['lat_grid', 'lon_grid', pd.Grouper(key='time')]).agg({
-        'TPW': 'mean'
-    }).reset_index()
+    print("\nFINAL:", counters)
 
-    return aggregated_df
+    progress_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await progress_task
+
+    print()
+    return output_csv_path
+
 
 def main():
-    is_colab = 'google.colab' in sys.modules
-    if is_colab:
-        from google.colab import drive
-        client = storage.Client()
-        print("Running in Colab. Mounting Google Drive...")
-        drive.mount('/content/drive', force_remount=True)
-        drive_path = '/content/drive/My Drive/'
+    bucket_name = "gcp-public-data-goes-16"
+    start_date = "2024-01-01"
+    end_date = "2024-02-02"
+
+    fields = [
+        "flash_id",
+        "flash_time_offset_of_first_event",
+        "product_time",
+        "flash_lat",
+        "flash_lon",
+        "flash_quality_flag",
+        "flash_energy",
+        # product_time_offset is added automatically
+    ]
+
+    lat_bounds = (0.0, 55.0)
+    lon_bounds = (-135.0, -45.0)
+
+    prefixes = generate_prefixes(start_date, end_date)
+
+    output_path = asyncio.run(
+        main_async(bucket_name, prefixes, fields, lat_bounds, lon_bounds, quality_max=1, output_csv_path=OUTPUT_CSV_PATH)
+    )
+
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        print(f"Data saved to {output_path}")
     else:
-        drive_path = os.getcwd()
+        print("No data written (or all rows filtered out).")
 
-    bucket_name = 'gcp-public-data-goes-16'
-    start_date = '2024-01-01'
-    end_date = '2024-09-01'
-
-    lat_bounds, lon_bounds = [0, 55], [-135, -45]
-    fields_to_extract = ['TPW', 'lat', 'lon','DQF', 'time_bounds']
-    current_date = datetime.strptime(start_date, '%Y-%m-%d')
-    end_dt = datetime.strptime(end_date, '%Y-%m-%d')
-
-    try:
-        while current_date <= end_dt:
-            current_start_date = current_date.strftime('%Y-%m-%d')
-            current_end_date = current_date.strftime('%Y-%m-%d')
-
-            print(f"Processing data for {current_start_date}")
-
-            prefixes = [f'ABI-L2-TPWC/{year}/{julian_day}/' for year in range(int(current_start_date[:4]), int(current_end_date[:4]) + 1)
-                        for julian_day in generate_julian_days(current_start_date, current_end_date)]
-
-            loop = asyncio.get_event_loop()
-            accumulated_data = loop.run_until_complete(main_async(bucket_name, prefixes, fields_to_extract, lat_bounds, lon_bounds))
-
-            if accumulated_data is not None:
-                print("PROCESSING")
-                columns = fields_to_extract
-                df = pd.DataFrame(accumulated_data, columns=columns)
-                final_df = aggregate_over_time_and_grid(df, lat_bounds, lon_bounds)
-                csv_file_path = os.path.join(drive_path, f'ABI_L2_TWPC_{current_start_date}_extracted_data.csv')
-                final_df.to_csv(csv_file_path, index=False)
-                print(f"Processing complete. Combined data saved to {csv_file_path}")
-            else:
-                print("No data processed.")
-
-            current_date += timedelta(days=1)
-    except Exception as e:
-        print(f"An error occurred: {e}")
 
 if __name__ == "__main__":
     main()

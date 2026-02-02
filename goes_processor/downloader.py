@@ -24,6 +24,7 @@ async def download_worker(bucket_name, download_queue, process_queue, session, d
             await process_queue.put(file_data)
             with download_counter.get_lock():
                 download_counter.value += 1
+                # print(f'downloaded: {download_counter}')
         else:
             with error_counter.get_lock():
                 error_counter.value += 1
