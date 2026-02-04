@@ -1,6 +1,8 @@
 #Pipeline output
 abi_glm_288_chunkwindow/
 filtered_data.csv
+goes19_abi_glm/
+*.csv
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
