@@ -71,7 +71,7 @@ class Cfg:
     tol_s: int = 180
 
     # HTTP
-    dl_conc: int = 64
+    dl_conc: int = 32
     timeout_s: int = 60
     retries: int = 3
     tcp_limit_per_host: int = 96
