@@ -18,7 +18,7 @@ class Cfg:
     timeout_s: int = 30
 
     dl_conc: int = 64
-    proc_workers: int = 8
+    proc_workers: int = 6
 
     list_q_max: int = 5000
     proc_q_max: int = 64 * 2
