@@ -14,6 +14,21 @@ CNN / later-transform friendliness added (alongside existing X):
 - time/bin_start_ns[bin], time/bin_center_ns[bin]  int64
 - abi/prod[prod]                  str
 
+Key semantics retained:
+- Always writes ALL 288 bins/day.
+- Missing ABI -> value=NaN, validfrac=0, present=0
+- Missing GLM -> flash_count=0, glm_present=0
+- GLM bin is considered present if ANY GLM file in that bin decodes successfully.
+
+CORE ENFORCEMENT (STRICT 5-MIN WINDOWS):
+- For both ABI and GLM, assign a file to bin k (window [t0, t1)) ONLY IF:
+    file_start >= t0  AND  file_end < t1
+- ABI: select at most one file per bin (earliest start if multiple qualify).
+- GLM: include all qualifying files per bin.
+
+Robust GOES filename time parser supports optional fractional digit:
+  _sYYYYJJJHHMMSSd  and  _eYYYYJJJHHMMSSd (d optional)
+
 Deps:
   pip install aiohttp netCDF4 numpy zarr pyproj
 """
@@ -57,7 +72,6 @@ class Cfg:
     end_date: str = "2026-02-01"
 
     coarsen_factor: int = 4
-    tol_s: int = 180
 
     # HTTP
     dl_conc: int = 32
@@ -74,7 +88,7 @@ class Cfg:
     # Bin chunking (key principle)
     bin_window: int = 24  # 12, 24, 48 are good
 
-    out_root: str = "./goes19_abi_glm"
+    out_root: str = "./goes_abi_glm"
     overwrite: bool = False
 
     # Zarr chunking (lag-friendly: chunk across time bins)
@@ -171,20 +185,47 @@ def merged_path(out_root: str, year: int, jday: int) -> str:
     return os.path.join(d, f"{year}{jday:03d}.zarr")
 
 
+def infer_satellite_from_bucket(bucket: str) -> str:
+    """
+    Best-effort satellite tag for metadata.
+    Examples:
+      gcp-public-data-goes-19 -> GOES-19
+      gcp-public-data-goes-16 -> GOES-16
+    """
+    m = re.search(r"goes-(\d+)", bucket)
+    if not m:
+        return "UNKNOWN"
+    return f"GOES-{int(m.group(1))}"
+
+
 # =============================================================================
 # Time helpers
 # =============================================================================
 
-_PAT = re.compile(r"_s(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})")
+# Robust GOES time parsers: support optional fractional digit at end of seconds
+# _sYYYYJJJHHMMSS[d] and _eYYYYJJJHHMMSS[d]  (d optional)
+_PAT_S = re.compile(r"_s(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})(\d)?")
+_PAT_E = re.compile(r"_e(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})(\d)?")
 
+def _dt_from_parts(y: int, j: int, hh: int, mm: int, ss: int, tenth: int | None) -> datetime:
+    base = datetime(y, 1, 1, tzinfo=timezone.utc) + timedelta(days=j - 1, hours=hh, minutes=mm, seconds=ss)
+    if tenth is not None:
+        base += timedelta(milliseconds=100 * int(tenth))  # tenth-of-second -> 100 ms
+    return base
 
 def parse_scan_start_utc(blob_name: str) -> datetime | None:
-    m = _PAT.search(blob_name)
+    m = _PAT_S.search(blob_name)
     if not m:
         return None
-    y, j, hh, mm, ss = map(int, m.groups())
-    return datetime(y, 1, 1, tzinfo=timezone.utc) + timedelta(days=j - 1, hours=hh, minutes=mm, seconds=ss)
+    y, j, hh, mm, ss, tenth = m.groups()
+    return _dt_from_parts(int(y), int(j), int(hh), int(mm), int(ss), int(tenth) if tenth else None)
 
+def parse_scan_end_utc(blob_name: str) -> datetime | None:
+    m = _PAT_E.search(blob_name)
+    if not m:
+        return None
+    y, j, hh, mm, ss, tenth = m.groups()
+    return _dt_from_parts(int(y), int(j), int(hh), int(mm), int(ss), int(tenth) if tenth else None)
 
 def date_iter_utc(start_date: str, end_date: str):
     a = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -194,10 +235,8 @@ def date_iter_utc(start_date: str, end_date: str):
         yield cur
         cur += timedelta(days=1)
 
-
 def day0_utc(year: int, jday: int) -> datetime:
     return datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=jday - 1)
-
 
 def build_5min_bin_starts_ns(year: int, jday: int) -> np.ndarray:
     d0 = day0_utc(year, jday)
@@ -256,7 +295,10 @@ async def list_day_product_async(
     year: int,
     jday: int,
     list_sem: asyncio.Semaphore,
-) -> list[tuple[datetime, str]]:
+) -> list[tuple[datetime, datetime, str]]:
+    """
+    Return (start_utc, end_utc, blob_name) for all files matching prod.must_contain.
+    """
     prefixes = [f"{prod.product}/{year}/{jday:03d}/{hh:02d}/" for hh in range(24)]
     tasks = [asyncio.create_task(_gcs_list_names_http(session, cfg.bucket, pfx, list_sem)) for pfx in prefixes]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -267,45 +309,72 @@ async def list_day_product_async(
             continue
         names.extend(res)
 
-    pairs: list[tuple[datetime, str]] = []
+    triples: list[tuple[datetime, datetime, str]] = []
     for n in names:
         if prod.must_contain not in n:
             continue
-        t = parse_scan_start_utc(n)
-        if t is not None:
-            pairs.append((t, n))
-    pairs.sort(key=lambda x: x[0])
-    return pairs
+        ts = parse_scan_start_utc(n)
+        te = parse_scan_end_utc(n)
+        if ts is None or te is None:
+            continue
+        triples.append((ts, te, n))
+
+    triples.sort(key=lambda x: x[0])
+    return triples
 
 
 # =============================================================================
-# ABI selection + GLM binning (pure metadata)
+# STRICT 5-min window assignment
 # =============================================================================
 
-def choose_blob_nearest_per_bin(day0: datetime, pairs: list[tuple[datetime, str]], tol_s: int) -> list[str | None]:
-    centers = [day0 + timedelta(seconds=300 * k + 150) for k in range(N_BINS)]
+def abi_select_strict_per_bin(day0: datetime, triples: list[tuple[datetime, datetime, str]]) -> list[str | None]:
+    """
+    ABI: For each bin [t0, t1), select at most one file with:
+        start >= t0 AND end < t1
+    If multiple qualify, choose earliest start.
+    O(nfiles).
+    """
     sel: list[str | None] = [None] * N_BINS
-    best_dt = [float("inf")] * N_BINS
+    best_start: list[datetime | None] = [None] * N_BINS
 
-    for t, blob in pairs:
-        dt0 = (t - day0).total_seconds()
-        k = int(round((dt0 - 150.0) / 300.0))
+    for ts, te, blob in triples:
+        dt0 = (ts - day0).total_seconds()
+        k = int(dt0 // 300.0)
         if k < 0 or k >= N_BINS:
             continue
-        d = abs((t - centers[k]).total_seconds())
-        if d <= tol_s and d < best_dt[k]:
-            best_dt[k] = d
-            sel[k] = blob
+
+        t0 = day0 + timedelta(seconds=300 * k)
+        t1 = t0 + timedelta(seconds=300)
+
+        if ts >= t0 and te < t1:
+            bs = best_start[k]
+            if bs is None or ts < bs:
+                best_start[k] = ts
+                sel[k] = blob
+
     return sel
 
 
-def group_glm_blobs_into_bins(day0: datetime, pairs: list[tuple[datetime, str]]) -> list[list[str]]:
+def glm_group_strict_into_bins(day0: datetime, triples: list[tuple[datetime, datetime, str]]) -> list[list[str]]:
+    """
+    GLM: For each bin [t0, t1), include file if:
+        start >= t0 AND end < t1
+    O(nfiles).
+    """
     bins: list[list[str]] = [[] for _ in range(N_BINS)]
-    for t, blob in pairs:
-        dt = (t - day0).total_seconds()
-        k = int(dt // 300.0)
-        if 0 <= k < N_BINS:
+
+    for ts, te, blob in triples:
+        dt0 = (ts - day0).total_seconds()
+        k = int(dt0 // 300.0)
+        if k < 0 or k >= N_BINS:
+            continue
+
+        t0 = day0 + timedelta(seconds=300 * k)
+        t1 = t0 + timedelta(seconds=300)
+
+        if ts >= t0 and te < t1:
             bins[k].append(blob)
+
     return bins
 
 
@@ -609,9 +678,9 @@ def init_zarr_store_fixed288_atomic(
             "schema_version": "v2_ml_friendly",
             "year": year,
             "jday": jday,
-            "abi_tol_s": cfg.tol_s,
             "coarsen_factor": cfg.coarsen_factor,
-            "glm_aggregation": "[t0, t0+5min)",
+            "glm_aggregation": "STRICT [t0, t0+5min): start>=t0 and end<t1",
+            "abi_selection": "STRICT [t0, t0+5min): start>=t0 and end<t1",
             "filled_missing_with_nan": True,
             "channels": int(N_CH),
             "bins_per_day": int(N_BINS),
@@ -623,7 +692,7 @@ def init_zarr_store_fixed288_atomic(
             "abi_dqf_vars": [p.dqf_var for p in ABI_PRODUCTS],
             "glm_product": PROD_GLM.product,
             "data_source_bucket": cfg.bucket,
-            # Store exactly what the ABI probe declares
+            "data_source_satellite": infer_satellite_from_bucket(cfg.bucket),
             "goes_geos": goes_geos,
         }
     )
@@ -775,7 +844,7 @@ async def process_one_day(
         log(f"SKIP {day.date().isoformat()} ({year}{jday:03d}) already merged")
         return True
 
-    log(f"=== {day.date().isoformat()} ({year}{jday:03d}) ABI+GLM chunk-window ===")
+    log(f"=== {day.date().isoformat()} ({year}{jday:03d}) ABI+GLM chunk-window (STRICT 5-min) ===")
 
     d0 = day0_utc(year, jday)
     starts_ns = build_5min_bin_starts_ns(year, jday)
@@ -788,16 +857,17 @@ async def process_one_day(
     abi_tasks = [asyncio.create_task(list_day_product_async(session, prod, year, jday, list_sem)) for prod in ABI_PRODUCTS]
     glm_task = asyncio.create_task(list_day_product_async(session, PROD_GLM, year, jday, list_sem))
 
-    abi_pairs_list = await asyncio.gather(*abi_tasks)
-    glm_pairs = await glm_task
+    abi_triples_list = await asyncio.gather(*abi_tasks)
+    glm_triples = await glm_task
 
     log(f"listing done in {time.perf_counter() - t_list0:.2f}s")
 
+    # STRICT 5-min mapping
     abi_sel: dict[str, list[str | None]] = {}
-    for prod, pairs in zip(ABI_PRODUCTS, abi_pairs_list):
-        abi_sel[prod.key] = choose_blob_nearest_per_bin(d0, pairs, cfg.tol_s) if pairs else [None] * N_BINS
+    for prod, triples in zip(ABI_PRODUCTS, abi_triples_list):
+        abi_sel[prod.key] = abi_select_strict_per_bin(d0, triples) if triples else [None] * N_BINS
 
-    glm_bins = group_glm_blobs_into_bins(d0, glm_pairs) if glm_pairs else [[] for _ in range(N_BINS)]
+    glm_bins = glm_group_strict_into_bins(d0, glm_triples) if glm_triples else [[] for _ in range(N_BINS)]
 
     # Probe reference ABI (shape + x/y + goes projection)
     log("probing ABI reference (raw shape + x/y + goes_imager_projection)...")

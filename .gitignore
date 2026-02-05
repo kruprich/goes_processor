@@ -4,6 +4,8 @@ filtered_data.csv
 goes19_abi_glm/
 *.csv
 
+/goes_abi_glm
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
