@@ -20,7 +20,7 @@ Key semantics retained:
 - Missing GLM -> flash_count=0, glm_present=0
 - GLM bin is considered present if ANY GLM file in that bin decodes successfully.
 
-CORE ENFORCEMENT (STRICT 5-MIN WINDOWS):
+STRICT 5-MIN WINDOW ASSIGNMENT:
 - For both ABI and GLM, assign a file to bin k (window [t0, t1)) ONLY IF:
     file_start >= t0  AND  file_end < t1
 - ABI: select at most one file per bin (earliest start if multiple qualify).
@@ -30,6 +30,9 @@ PARTIAL ZARR SAFETY:
 - Zarr stores have attrs.complete=False at init.
 - Only SKIP if attrs.complete==True.
 - If an existing store is partial (complete!=True), it is deleted and rebuilt.
+
+NO-COARSEN OPTION:
+- cfg.coarsen_factor can be None (or 1) to disable coarsening (identity).
 
 Robust GOES filename time parser supports optional fractional digit:
   _sYYYYJJJHHMMSSd  and  _eYYYYJJJHHMMSSd (d optional)
@@ -76,7 +79,8 @@ class Cfg:
     start_date: str = "2025-10-16"
     end_date: str = "2026-02-01"
 
-    coarsen_factor: int = 4
+    # Set to None (or 1) for NO COARSEN (identity)
+    coarsen_factor: int | None = 4
 
     # HTTP
     dl_conc: int = 32
@@ -162,6 +166,22 @@ CHANNEL_NAMES = np.array(
 N_CH = int(CHANNEL_NAMES.shape[0])
 
 
+def coarsen_factor_eff() -> int:
+    """
+    Effective coarsen factor:
+      None -> 1 (no coarsen)
+      1    -> no coarsen
+      >1   -> coarsen by factor
+    """
+    f = cfg.coarsen_factor
+    if f is None:
+        return 1
+    f = int(f)
+    if f < 1:
+        raise ValueError("coarsen_factor must be >= 1 (or None)")
+    return f
+
+
 # =============================================================================
 # Logging + FS helpers
 # =============================================================================
@@ -185,9 +205,6 @@ def zarr_exists(path: str) -> bool:
 
 
 def zarr_is_complete(path: str) -> bool:
-    """
-    Only True if zarr exists and attrs.complete == True.
-    """
     if not zarr_exists(path):
         return False
     try:
@@ -198,9 +215,6 @@ def zarr_is_complete(path: str) -> bool:
 
 
 def mark_zarr_complete(root) -> None:
-    """
-    Mark completion. If this fails, day will be retried next run.
-    """
     root.attrs["complete"] = True
     root.attrs["completed_utc"] = datetime.now(timezone.utc).isoformat()
 
@@ -222,7 +236,6 @@ def infer_satellite_from_bucket(bucket: str) -> str:
 # Time helpers
 # =============================================================================
 
-# Robust GOES time parsers: support optional fractional digit at end of seconds
 _PAT_S = re.compile(r"_s(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})(\d)?")
 _PAT_E = re.compile(r"_e(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})(\d)?")
 
@@ -230,7 +243,7 @@ _PAT_E = re.compile(r"_e(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})(\d)?")
 def _dt_from_parts(y: int, j: int, hh: int, mm: int, ss: int, tenth: int | None) -> datetime:
     base = datetime(y, 1, 1, tzinfo=timezone.utc) + timedelta(days=j - 1, hours=hh, minutes=mm, seconds=ss)
     if tenth is not None:
-        base += timedelta(milliseconds=100 * int(tenth))  # tenth-of-second -> 100 ms
+        base += timedelta(milliseconds=100 * int(tenth))
     return base
 
 
@@ -320,9 +333,6 @@ async def list_day_product_async(
     jday: int,
     list_sem: asyncio.Semaphore,
 ) -> list[tuple[datetime, datetime, str]]:
-    """
-    Return (start_utc, end_utc, blob_name) for all files matching prod.must_contain.
-    """
     prefixes = [f"{prod.product}/{year}/{jday:03d}/{hh:02d}/" for hh in range(24)]
     tasks = [asyncio.create_task(_gcs_list_names_http(session, cfg.bucket, pfx, list_sem)) for pfx in prefixes]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -352,11 +362,6 @@ async def list_day_product_async(
 # =============================================================================
 
 def abi_select_strict_per_bin(day0: datetime, triples: list[tuple[datetime, datetime, str]]) -> list[str | None]:
-    """
-    ABI: For each bin [t0, t1), select at most one file with:
-        start >= t0 AND end < t1
-    If multiple qualify, choose earliest start.
-    """
     sel: list[str | None] = [None] * N_BINS
     best_start: list[datetime | None] = [None] * N_BINS
 
@@ -379,10 +384,6 @@ def abi_select_strict_per_bin(day0: datetime, triples: list[tuple[datetime, date
 
 
 def glm_group_strict_into_bins(day0: datetime, triples: list[tuple[datetime, datetime, str]]) -> list[list[str]]:
-    """
-    GLM: For each bin [t0, t1), include file if:
-        start >= t0 AND end < t1
-    """
     bins: list[list[str]] = [[] for _ in range(N_BINS)]
 
     for ts, te, blob in triples:
@@ -496,6 +497,9 @@ def abi_probe_reference(payload: bytes, value_var: str, dqf_var: str):
 
 
 def abi_coarsen_vectors_from_ref(x_raw: np.ndarray, y_raw: np.ndarray, factor: int):
+    if factor == 1:
+        return x_raw.astype(np.float64, copy=False), y_raw.astype(np.float64, copy=False)
+
     def trim1(v: np.ndarray):
         n2 = (v.shape[0] // factor) * factor
         return v[:n2]
@@ -536,6 +540,12 @@ def extract_abi_mean_valid_and_frac_refshape(
     val = pad_or_crop_2d(val, ref_raw_y, ref_raw_x, fill=np.nan)
     dqf = pad_or_crop_2d(dqf, ref_raw_y, ref_raw_x, fill=1).astype(np.int16, copy=False)
 
+    if factor == 1:
+        valid = (dqf == 0)
+        frac = valid.astype(np.float32, copy=False)
+        mean_valid = np.where(valid, val, np.nan).astype(np.float32, copy=False)
+        return mean_valid, frac
+
     # Consistent trim based on reference raw dims
     y2 = (ref_raw_y // factor) * factor
     x2 = (ref_raw_x // factor) * factor
@@ -551,8 +561,6 @@ def extract_abi_mean_valid_and_frac_refshape(
 
     cnt = np.maximum(frac * (factor * factor), 1.0).astype(np.float32, copy=False)
     mean_valid = (vv_sum / cnt).astype(np.float32, copy=False)
-
-    # if no valid pixels in a block, mean should be NaN
     mean_valid = np.where(frac > 0.0, mean_valid, np.nan).astype(np.float32, copy=False)
 
     return mean_valid, frac.astype(np.float32, copy=False)
@@ -616,7 +624,6 @@ def glm_flash_count_on_abi_grid(
     x_rad = x_rad[inb]
     y_rad = y_rad[inb]
 
-    # nearest-index assignment
     x_vec = x_vec_rad
     x_asc = x_vec[0] < x_vec[-1]
     if not x_asc:
@@ -675,8 +682,8 @@ def init_zarr_store_fixed288_atomic(
     jday: int,
     starts_ns: np.ndarray,
     goes_geos: dict[str, float | str],
+    factor: int,
 ):
-    # If store exists and overwrite is false, just open it (caller decides if partial)
     if zarr_exists(out_zarr) and not cfg.overwrite:
         return zarr.open_group(out_zarr, mode="r+")
 
@@ -697,7 +704,7 @@ def init_zarr_store_fixed288_atomic(
             "schema_version": "v2_ml_friendly",
             "year": year,
             "jday": jday,
-            "coarsen_factor": cfg.coarsen_factor,
+            "coarsen_factor": int(factor),
             "glm_aggregation": "STRICT [t0, t0+5min): start>=t0 and end<t1",
             "abi_selection": "STRICT [t0, t0+5min): start>=t0 and end<t1",
             "filled_missing_with_nan": True,
@@ -713,13 +720,11 @@ def init_zarr_store_fixed288_atomic(
             "data_source_bucket": cfg.bucket,
             "data_source_satellite": infer_satellite_from_bucket(cfg.bucket),
             "goes_geos": goes_geos,
-            # partial safety
             "complete": False,
             "completed_utc": None,
         }
     )
 
-    # Coordinates / metadata
     root.create_dataset("channel", shape=(N_CH,), dtype="U32", chunks=(N_CH,), overwrite=True)[:] = CHANNEL_NAMES
 
     root.create_dataset("time/bin_start_ns", shape=(N_BINS,), chunks=(1024,), dtype="i8", overwrite=True)[:] = (
@@ -736,7 +741,6 @@ def init_zarr_store_fixed288_atomic(
     root.create_dataset("grid/x_rad", shape=(x,), chunks=(min(x, 4096),), dtype="f8", overwrite=True)
     root.create_dataset("grid/y_rad", shape=(y,), chunks=(min(y, 4096),), dtype="f8", overwrite=True)
 
-    # Original monolithic tensor (retained)
     root.create_dataset(
         "X",
         shape=(N_BINS, N_CH, y, x),
@@ -747,7 +751,6 @@ def init_zarr_store_fixed288_atomic(
         compressor=compressor,
     )
 
-    # ML-friendly separated tensors
     root.create_dataset(
         "abi/value",
         shape=(N_BINS, N_PROD, y, x),
@@ -865,12 +868,14 @@ async def process_one_day(
         log(f"RETRY {day.date().isoformat()} ({year}{jday:03d}) found partial zarr (complete!=true); rebuilding")
         rm_tree(out_zarr)
 
+    factor = coarsen_factor_eff()
+
     log(f"=== {day.date().isoformat()} ({year}{jday:03d}) ABI+GLM chunk-window (STRICT 5-min) ===")
+    log(f"coarsen_factor: {cfg.coarsen_factor!r} -> effective={factor}")
 
     d0 = day0_utc(year, jday)
     starts_ns = build_5min_bin_starts_ns(year, jday)
 
-    # List all objects up-front
     list_sem = asyncio.Semaphore(cfg.list_conc)
     t_list0 = time.perf_counter()
     log("listing objects (async)...")
@@ -883,14 +888,12 @@ async def process_one_day(
 
     log(f"listing done in {time.perf_counter() - t_list0:.2f}s")
 
-    # STRICT 5-min mapping
     abi_sel: dict[str, list[str | None]] = {}
     for prod, triples in zip(ABI_PRODUCTS, abi_triples_list):
         abi_sel[prod.key] = abi_select_strict_per_bin(d0, triples) if triples else [None] * N_BINS
 
     glm_bins = glm_group_strict_into_bins(d0, glm_triples) if glm_triples else [[] for _ in range(N_BINS)]
 
-    # Probe reference ABI (shape + x/y + goes projection)
     log("probing ABI reference (raw shape + x/y + goes_imager_projection)...")
     probe_payload: bytes | None = None
     probe_prod: ProductCfg | None = None
@@ -916,10 +919,11 @@ async def process_one_day(
             probe_prod.value_var,  # type: ignore[arg-type]
             probe_prod.dqf_var,    # type: ignore[arg-type]
         )
-        x_vec, y_vec = abi_coarsen_vectors_from_ref(x_raw, y_raw, cfg.coarsen_factor)
+        x_vec, y_vec = abi_coarsen_vectors_from_ref(x_raw, y_raw, factor)
         y0, x0 = int(y_vec.shape[0]), int(x_vec.shape[0])
+
         log(
-            f"probe OK: ref_raw={ref_raw_y}x{ref_raw_x} -> coarsened={y0}x{x0} "
+            f"probe OK: ref_raw={ref_raw_y}x{ref_raw_x} -> grid={y0}x{x0} "
             f"lon0={goes_geos['lon0_deg']} h={goes_geos['h_m']} sweep={goes_geos['sweep']} "
             f"({os.path.basename(probe_blob or '')})"
         )
@@ -927,7 +931,6 @@ async def process_one_day(
         log(f"!! probe failed: {repr(e)}")
         return False
 
-    # Init zarr
     try:
         root = init_zarr_store_fixed288_atomic(
             out_zarr,
@@ -937,12 +940,12 @@ async def process_one_day(
             jday=jday,
             starts_ns=starts_ns,
             goes_geos=goes_geos,
+            factor=factor,
         )
     except Exception as e:
         log(f"!! init zarr failed: {repr(e)}")
         return False
 
-    # Write grid vectors once (coarsened rad coords)
     try:
         root["grid/x_rad"][:] = x_vec.astype(np.float64, copy=False)
         root["grid/y_rad"][:] = y_vec.astype(np.float64, copy=False)
@@ -965,7 +968,7 @@ async def process_one_day(
                 payload,
                 prod.value_var,
                 prod.dqf_var,
-                cfg.coarsen_factor,
+                factor,
                 ref_raw_y,
                 ref_raw_x,
             )  # type: ignore[arg-type]
@@ -1191,6 +1194,9 @@ def main():
         print("Missing deps. Install:")
         print("  pip install aiohttp netCDF4 numpy zarr pyproj")
         sys.exit(1)
+
+    # validate coarsen_factor
+    _ = coarsen_factor_eff()
 
     asyncio.run(run_all())
 
