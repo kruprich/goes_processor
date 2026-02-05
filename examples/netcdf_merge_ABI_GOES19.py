@@ -2,12 +2,6 @@
 GOES ABI (CONUS L2) + GLM (LCFA) -> EXACT 288 5-min bins/day (chunk-windowed, robust)
 ====================================================================================
 
-Key properties retained:
-- Always writes ALL 288 bins/day.
-- Missing ABI -> value=NaN, validfrac=0, present=0
-- Missing GLM -> flash_count=0, glm_present=0
-- GLM bin is considered present if ANY GLM file in that bin decodes successfully.
-
 CNN / later-transform friendliness added (alongside existing X):
 - abi/value[bin, prod, y, x]      float32 (NaN where invalid/missing)
 - abi/validfrac[bin, prod, y, x]  float32
@@ -19,15 +13,6 @@ CNN / later-transform friendliness added (alongside existing X):
 - grid/x_rad[x], grid/y_rad[y]    float64 (coarsened grid vectors)
 - time/bin_start_ns[bin], time/bin_center_ns[bin]  int64
 - abi/prod[prod]                  str
-
-Chunking updated to be lag-friendly (chunk across time bins):
-- X chunks: (time_chunk, channel, chunk_y, chunk_x)
-- abi/value chunks: (time_chunk, prod, chunk_y, chunk_x)
-- glm/flash_count chunks: (time_chunk, chunk_y, chunk_x)
-
-IMPORTANT CHANGE:
-- GOES fixed-grid projection parameters for GLM->ABI (lon0/h/a/b/sweep)
-  are read from the ABI netCDF probe ("goes_imager_projection") and are NOT hardcoded.
 
 Deps:
   pip install aiohttp netCDF4 numpy zarr pyproj
