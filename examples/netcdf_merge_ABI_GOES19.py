@@ -622,6 +622,7 @@ def init_zarr_store_fixed288_atomic(
             "abi_value_vars": [p.value_var for p in ABI_PRODUCTS],
             "abi_dqf_vars": [p.dqf_var for p in ABI_PRODUCTS],
             "glm_product": PROD_GLM.product,
+            "data_source_bucket": cfg.bucket,
             # Store exactly what the ABI probe declares
             "goes_geos": goes_geos,
         }
