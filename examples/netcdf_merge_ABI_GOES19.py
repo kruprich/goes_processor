@@ -1,6 +1,6 @@
 """
-GOES-16 ABI (CONUS L2) + GLM (LCFA) -> EXACT 288 5-min bins/day (chunk-windowed, robust)
-======================================================================================
+GOES ABI (CONUS L2) + GLM (LCFA) -> EXACT 288 5-min bins/day (chunk-windowed, robust)
+====================================================================================
 
 Key properties retained:
 - Always writes ALL 288 bins/day.
@@ -24,6 +24,10 @@ Chunking updated to be lag-friendly (chunk across time bins):
 - X chunks: (time_chunk, channel, chunk_y, chunk_x)
 - abi/value chunks: (time_chunk, prod, chunk_y, chunk_x)
 - glm/flash_count chunks: (time_chunk, chunk_y, chunk_x)
+
+IMPORTANT CHANGE:
+- GOES fixed-grid projection parameters for GLM->ABI (lon0/h/a/b/sweep)
+  are read from the ABI netCDF probe ("goes_imager_projection") and are NOT hardcoded.
 
 Deps:
   pip install aiohttp netCDF4 numpy zarr pyproj
@@ -95,13 +99,6 @@ class Cfg:
 
     list_conc: int = 48
     warn_write_s: float = 20.0
-
-    # GOES fixed-grid projection params for GLM->ABI grid
-    goes_lon0_deg: float = -75.0
-    goes_h_m: float = 35786023.0
-    goes_a_m: float = 6378137.0
-    goes_b_m: float = 6356752.31414
-    goes_sweep: str = "x"
 
 
 cfg = Cfg()
@@ -377,6 +374,32 @@ def squeeze_1d(v: np.ndarray, name: str) -> np.ndarray:
 # ABI probe + decode (reference raw shape, consistent coarsen)
 # =============================================================================
 
+def abi_probe_goes_geos_params(payload: bytes) -> dict[str, float | str]:
+    """
+    Read GOES fixed-grid (GEOS) projection parameters from ABI L2 probe file.
+    Expected CF projection variable: goes_imager_projection
+    """
+    import netCDF4 as nc
+
+    with nc.Dataset("inmem", mode="r", memory=payload) as ds:
+        if "goes_imager_projection" not in ds.variables:
+            raise KeyError("ABI file missing goes_imager_projection variable")
+        p = ds.variables["goes_imager_projection"]
+
+        def _need(name: str):
+            if not hasattr(p, name):
+                raise KeyError(f"goes_imager_projection missing attribute {name!r}")
+            return getattr(p, name)
+
+        return {
+            "lon0_deg": float(_need("longitude_of_projection_origin")),
+            "h_m": float(_need("perspective_point_height")),
+            "a_m": float(_need("semi_major_axis")),
+            "b_m": float(_need("semi_minor_axis")),
+            "sweep": str(_need("sweep_angle_axis")),
+        }
+
+
 def abi_probe_reference(payload: bytes, value_var: str, dqf_var: str):
     import netCDF4 as nc
 
@@ -396,7 +419,8 @@ def abi_probe_reference(payload: bytes, value_var: str, dqf_var: str):
         y_raw = squeeze_1d(ds.variables["y"][:], "probe:y").astype(np.float64, copy=False)
 
     ref_raw_y, ref_raw_x = int(val.shape[0]), int(val.shape[1])
-    return ref_raw_y, ref_raw_x, x_raw, y_raw
+    goes_geos = abi_probe_goes_geos_params(payload)
+    return ref_raw_y, ref_raw_x, x_raw, y_raw, goes_geos
 
 
 def abi_coarsen_vectors_from_ref(x_raw: np.ndarray, y_raw: np.ndarray, factor: int):
@@ -554,16 +578,16 @@ def glm_flash_count_on_abi_grid(
     return out
 
 
-def _decode_glm(payload: bytes, x_vec_rad: np.ndarray, y_vec_rad: np.ndarray):
+def _decode_glm(payload: bytes, x_vec_rad: np.ndarray, y_vec_rad: np.ndarray, goes_geos: dict[str, float | str]):
     return glm_flash_count_on_abi_grid(
         payload,
         x_vec_rad=x_vec_rad,
         y_vec_rad=y_vec_rad,
-        lon0_deg=cfg.goes_lon0_deg,
-        h_m=cfg.goes_h_m,
-        a_m=cfg.goes_a_m,
-        b_m=cfg.goes_b_m,
-        sweep=cfg.goes_sweep,
+        lon0_deg=float(goes_geos["lon0_deg"]),
+        h_m=float(goes_geos["h_m"]),
+        a_m=float(goes_geos["a_m"]),
+        b_m=float(goes_geos["b_m"]),
+        sweep=str(goes_geos["sweep"]),
     )
 
 
@@ -578,6 +602,7 @@ def init_zarr_store_fixed288_atomic(
     year: int,
     jday: int,
     starts_ns: np.ndarray,
+    goes_geos: dict[str, float | str],
 ):
     if zarr_exists(out_zarr) and not cfg.overwrite:
         return zarr.open_group(out_zarr, mode="r+")
@@ -612,13 +637,8 @@ def init_zarr_store_fixed288_atomic(
             "abi_value_vars": [p.value_var for p in ABI_PRODUCTS],
             "abi_dqf_vars": [p.dqf_var for p in ABI_PRODUCTS],
             "glm_product": PROD_GLM.product,
-            "goes_geos": {
-                "lon0_deg": cfg.goes_lon0_deg,
-                "h_m": cfg.goes_h_m,
-                "a_m": cfg.goes_a_m,
-                "b_m": cfg.goes_b_m,
-                "sweep": cfg.goes_sweep,
-            },
+            # Store exactly what the ABI probe declares
+            "goes_geos": goes_geos,
         }
     )
 
@@ -793,11 +813,11 @@ async def process_one_day(
 
     glm_bins = group_glm_blobs_into_bins(d0, glm_pairs) if glm_pairs else [[] for _ in range(N_BINS)]
 
-    # Probe reference ABI (shape + x/y)
-    log("probing ABI reference (raw shape + x/y)...")
-    probe_payload = None
-    probe_prod = None
-    probe_blob = None
+    # Probe reference ABI (shape + x/y + goes projection)
+    log("probing ABI reference (raw shape + x/y + goes_imager_projection)...")
+    probe_payload: bytes | None = None
+    probe_prod: ProductCfg | None = None
+    probe_blob: str | None = None
 
     for prod in ABI_PRODUCTS:
         blob = next((b for b in abi_sel[prod.key] if b), None)
@@ -814,21 +834,33 @@ async def process_one_day(
         return False
 
     try:
-        ref_raw_y, ref_raw_x, x_raw, y_raw = abi_probe_reference(
+        ref_raw_y, ref_raw_x, x_raw, y_raw, goes_geos = abi_probe_reference(
             probe_payload,
             probe_prod.value_var,  # type: ignore[arg-type]
             probe_prod.dqf_var,    # type: ignore[arg-type]
         )
         x_vec, y_vec = abi_coarsen_vectors_from_ref(x_raw, y_raw, cfg.coarsen_factor)
         y0, x0 = int(y_vec.shape[0]), int(x_vec.shape[0])
-        log(f"probe OK: ref_raw={ref_raw_y}x{ref_raw_x} -> coarsened={y0}x{x0} ({os.path.basename(probe_blob or '')})")
+        log(
+            f"probe OK: ref_raw={ref_raw_y}x{ref_raw_x} -> coarsened={y0}x{x0} "
+            f"lon0={goes_geos['lon0_deg']} h={goes_geos['h_m']} sweep={goes_geos['sweep']} "
+            f"({os.path.basename(probe_blob or '')})"
+        )
     except Exception as e:
         log(f"!! probe failed: {repr(e)}")
         return False
 
-    # Init zarr
+    # Init zarr (store goes_geos from probe)
     try:
-        root = init_zarr_store_fixed288_atomic(out_zarr, y=y0, x=x0, year=year, jday=jday, starts_ns=starts_ns)
+        root = init_zarr_store_fixed288_atomic(
+            out_zarr,
+            y=y0,
+            x=x0,
+            year=year,
+            jday=jday,
+            starts_ns=starts_ns,
+            goes_geos=goes_geos,
+        )
     except Exception as e:
         log(f"!! init zarr failed: {repr(e)}")
         return False
@@ -838,7 +870,6 @@ async def process_one_day(
         root["grid/x_rad"][:] = x_vec.astype(np.float64, copy=False)
         root["grid/y_rad"][:] = y_vec.astype(np.float64, copy=False)
     except Exception:
-        # Not fatal; data are still usable
         pass
 
     loop = asyncio.get_running_loop()
@@ -861,7 +892,6 @@ async def process_one_day(
                 ref_raw_y,
                 ref_raw_x,
             )  # type: ignore[arg-type]
-            # Guard shapes:
             v2 = pad_or_crop_2d(v.astype(np.float32, copy=False), y0, x0, fill=np.nan)
             f2 = pad_or_crop_2d(f.astype(np.float32, copy=False), y0, x0, fill=0.0)
             return (bin_k, prod.key, True, v2, f2)
@@ -875,7 +905,7 @@ async def process_one_day(
             return (bin_k, False, None)
 
         try:
-            cnt = await loop.run_in_executor(pool, _decode_glm, payload, x_vec, y_vec)
+            cnt = await loop.run_in_executor(pool, _decode_glm, payload, x_vec, y_vec, goes_geos)
             cnt2 = pad_or_crop_2d(cnt.astype(np.float32, copy=False), y0, x0, fill=0.0)
             return (bin_k, True, cnt2)
         except Exception:
@@ -887,7 +917,6 @@ async def process_one_day(
         k1 = min(N_BINS, k0 + cfg.bin_window)
         nwin = k1 - k0
 
-        # Window accumulators
         cm_v = [np.full((y0, x0), np.nan, dtype=np.float32) for _ in range(nwin)]
         ac_v = [np.full((y0, x0), np.nan, dtype=np.float32) for _ in range(nwin)]
         tp_v = [np.full((y0, x0), np.nan, dtype=np.float32) for _ in range(nwin)]
@@ -909,7 +938,6 @@ async def process_one_day(
             wi = k - k0
             glm_listed[wi] = np.int16(min(len(glm_bins[k]), 32767))
 
-        # Build tasks
         tasks: list[asyncio.Task] = []
         for k in range(k0, k1):
             for prod in ABI_PRODUCTS:
@@ -921,7 +949,6 @@ async def process_one_day(
 
         results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
 
-        # Apply results
         for r in results:
             if isinstance(r, Exception) or not r:
                 continue
@@ -941,9 +968,6 @@ async def process_one_day(
                     else:
                         tp_m[wi] = np.uint8(1)
                         tp_v[wi], tp_f[wi] = v, f
-                else:
-                    # explicit failure (leave defaults: NaN + 0 vf + present=0)
-                    pass
             else:
                 bin_k, pres, cnt = r
                 if not (k0 <= bin_k < k1):
@@ -954,7 +978,6 @@ async def process_one_day(
                     glm_m[wi] = np.uint8(1)
                     glm_ok[wi] = np.int16(min(int(glm_ok[wi]) + 1, 32767))
 
-        # Assemble original X
         X_blk = np.empty((nwin, N_CH, y0, x0), dtype=np.float32)
         for wi in range(nwin):
             X_blk[wi] = np.stack(
@@ -974,14 +997,12 @@ async def process_one_day(
                 axis=0,
             )
 
-        # Assemble ML-friendly tensors
-        abi_value_blk = np.stack([cm_v, ac_v, tp_v], axis=1).astype(np.float32, copy=False)  # (nwin, prod, y, x)
-        abi_vf_blk = np.stack([cm_f, ac_f, tp_f], axis=1).astype(np.float32, copy=False)     # (nwin, prod, y, x)
-        abi_pres_blk = np.stack([cm_m, ac_m, tp_m], axis=1).astype(np.uint8, copy=False)     # (nwin, prod)
-        glm_cnt_blk = np.stack(glm_sum, axis=0).astype(np.float32, copy=False)               # (nwin, y, x)
-        glm_pres_blk = np.asarray(glm_m, dtype=np.uint8)                                     # (nwin,)
+        abi_value_blk = np.stack([cm_v, ac_v, tp_v], axis=1).astype(np.float32, copy=False)
+        abi_vf_blk = np.stack([cm_f, ac_f, tp_f], axis=1).astype(np.float32, copy=False)
+        abi_pres_blk = np.stack([cm_m, ac_m, tp_m], axis=1).astype(np.uint8, copy=False)
+        glm_cnt_blk = np.stack(glm_sum, axis=0).astype(np.float32, copy=False)
+        glm_pres_blk = np.asarray(glm_m, dtype=np.uint8)
 
-        # Write window
         t_write0 = time.perf_counter()
         async with write_lock:
             await asyncio.to_thread(
@@ -1002,9 +1023,7 @@ async def process_one_day(
             log(f"writer: WARNING slow write bins {k0}:{k1}  {dtw:.2f}s")
 
         if k0 == 0 or (k0 // cfg.bin_window) % 2 == 0:
-            
             log(f"{day.date().isoformat()} wrote bins {k0:03d}-{k1-1:03d} / {N_BINS-1:03d}")
-
 
     log(f"-> wrote merged: {out_zarr}  bins={N_BINS}  grid={y0}x{x0}")
     return True
