@@ -26,6 +26,11 @@ CORE ENFORCEMENT (STRICT 5-MIN WINDOWS):
 - ABI: select at most one file per bin (earliest start if multiple qualify).
 - GLM: include all qualifying files per bin.
 
+PARTIAL ZARR SAFETY:
+- Zarr stores have attrs.complete=False at init.
+- Only SKIP if attrs.complete==True.
+- If an existing store is partial (complete!=True), it is deleted and rebuilt.
+
 Robust GOES filename time parser supports optional fractional digit:
   _sYYYYJJJHHMMSSd  and  _eYYYYJJJHHMMSSd (d optional)
 
@@ -158,7 +163,7 @@ N_CH = int(CHANNEL_NAMES.shape[0])
 
 
 # =============================================================================
-# Logging
+# Logging + FS helpers
 # =============================================================================
 
 def log(msg: str):
@@ -179,6 +184,27 @@ def zarr_exists(path: str) -> bool:
     return os.path.isdir(path) and os.path.exists(os.path.join(path, ".zgroup"))
 
 
+def zarr_is_complete(path: str) -> bool:
+    """
+    Only True if zarr exists and attrs.complete == True.
+    """
+    if not zarr_exists(path):
+        return False
+    try:
+        root = zarr.open_group(path, mode="r")
+        return bool(root.attrs.get("complete", False))
+    except Exception:
+        return False
+
+
+def mark_zarr_complete(root) -> None:
+    """
+    Mark completion. If this fails, day will be retried next run.
+    """
+    root.attrs["complete"] = True
+    root.attrs["completed_utc"] = datetime.now(timezone.utc).isoformat()
+
+
 def merged_path(out_root: str, year: int, jday: int) -> str:
     d = os.path.join(out_root, "merged", str(year))
     ensure_dir(d)
@@ -186,12 +212,6 @@ def merged_path(out_root: str, year: int, jday: int) -> str:
 
 
 def infer_satellite_from_bucket(bucket: str) -> str:
-    """
-    Best-effort satellite tag for metadata.
-    Examples:
-      gcp-public-data-goes-19 -> GOES-19
-      gcp-public-data-goes-16 -> GOES-16
-    """
     m = re.search(r"goes-(\d+)", bucket)
     if not m:
         return "UNKNOWN"
@@ -203,15 +223,16 @@ def infer_satellite_from_bucket(bucket: str) -> str:
 # =============================================================================
 
 # Robust GOES time parsers: support optional fractional digit at end of seconds
-# _sYYYYJJJHHMMSS[d] and _eYYYYJJJHHMMSS[d]  (d optional)
 _PAT_S = re.compile(r"_s(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})(\d)?")
 _PAT_E = re.compile(r"_e(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})(\d)?")
+
 
 def _dt_from_parts(y: int, j: int, hh: int, mm: int, ss: int, tenth: int | None) -> datetime:
     base = datetime(y, 1, 1, tzinfo=timezone.utc) + timedelta(days=j - 1, hours=hh, minutes=mm, seconds=ss)
     if tenth is not None:
         base += timedelta(milliseconds=100 * int(tenth))  # tenth-of-second -> 100 ms
     return base
+
 
 def parse_scan_start_utc(blob_name: str) -> datetime | None:
     m = _PAT_S.search(blob_name)
@@ -220,12 +241,14 @@ def parse_scan_start_utc(blob_name: str) -> datetime | None:
     y, j, hh, mm, ss, tenth = m.groups()
     return _dt_from_parts(int(y), int(j), int(hh), int(mm), int(ss), int(tenth) if tenth else None)
 
+
 def parse_scan_end_utc(blob_name: str) -> datetime | None:
     m = _PAT_E.search(blob_name)
     if not m:
         return None
     y, j, hh, mm, ss, tenth = m.groups()
     return _dt_from_parts(int(y), int(j), int(hh), int(mm), int(ss), int(tenth) if tenth else None)
+
 
 def date_iter_utc(start_date: str, end_date: str):
     a = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -235,8 +258,10 @@ def date_iter_utc(start_date: str, end_date: str):
         yield cur
         cur += timedelta(days=1)
 
+
 def day0_utc(year: int, jday: int) -> datetime:
     return datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=jday - 1)
+
 
 def build_5min_bin_starts_ns(year: int, jday: int) -> np.ndarray:
     d0 = day0_utc(year, jday)
@@ -259,7 +284,6 @@ async def _gcs_list_names_http(
 
     base = f"https://storage.googleapis.com/storage/v1/b/{bucket}/o"
     timeout = aiohttp.ClientTimeout(total=cfg.timeout_s)
-
     params = {"prefix": prefix, "fields": "items(name),nextPageToken", "maxResults": "1000"}
 
     while True:
@@ -332,7 +356,6 @@ def abi_select_strict_per_bin(day0: datetime, triples: list[tuple[datetime, date
     ABI: For each bin [t0, t1), select at most one file with:
         start >= t0 AND end < t1
     If multiple qualify, choose earliest start.
-    O(nfiles).
     """
     sel: list[str | None] = [None] * N_BINS
     best_start: list[datetime | None] = [None] * N_BINS
@@ -359,7 +382,6 @@ def glm_group_strict_into_bins(day0: datetime, triples: list[tuple[datetime, dat
     """
     GLM: For each bin [t0, t1), include file if:
         start >= t0 AND end < t1
-    O(nfiles).
     """
     bins: list[list[str]] = [[] for _ in range(N_BINS)]
 
@@ -429,10 +451,6 @@ def squeeze_1d(v: np.ndarray, name: str) -> np.ndarray:
 # =============================================================================
 
 def abi_probe_goes_geos_params(payload: bytes) -> dict[str, float | str]:
-    """
-    Read GOES fixed-grid (GEOS) projection parameters from ABI L2 probe file.
-    Expected CF projection variable: goes_imager_projection
-    """
     import netCDF4 as nc
 
     with nc.Dataset("inmem", mode="r", memory=payload) as ds:
@@ -534,7 +552,7 @@ def extract_abi_mean_valid_and_frac_refshape(
     cnt = np.maximum(frac * (factor * factor), 1.0).astype(np.float32, copy=False)
     mean_valid = (vv_sum / cnt).astype(np.float32, copy=False)
 
-    # IMPORTANT: if no valid pixels in a block, mean should be NaN
+    # if no valid pixels in a block, mean should be NaN
     mean_valid = np.where(frac > 0.0, mean_valid, np.nan).astype(np.float32, copy=False)
 
     return mean_valid, frac.astype(np.float32, copy=False)
@@ -658,6 +676,7 @@ def init_zarr_store_fixed288_atomic(
     starts_ns: np.ndarray,
     goes_geos: dict[str, float | str],
 ):
+    # If store exists and overwrite is false, just open it (caller decides if partial)
     if zarr_exists(out_zarr) and not cfg.overwrite:
         return zarr.open_group(out_zarr, mode="r+")
 
@@ -694,6 +713,9 @@ def init_zarr_store_fixed288_atomic(
             "data_source_bucket": cfg.bucket,
             "data_source_satellite": infer_satellite_from_bucket(cfg.bucket),
             "goes_geos": goes_geos,
+            # partial safety
+            "complete": False,
+            "completed_utc": None,
         }
     )
 
@@ -809,14 +831,9 @@ def _zarr_write_window_sync(
     glm_listed_blk: np.ndarray,
     glm_ok_blk: np.ndarray,
 ):
-    """
-    Writes one contiguous bin window [k0:k0+nwin] into all datasets.
-    All inputs are numpy arrays sized to nwin.
-    """
     k1 = k0 + X_blk.shape[0]
 
     root["X"][k0:k1, :, :, :] = X_blk
-
     root["abi/value"][k0:k1, :, :, :] = abi_value_blk
     root["abi/validfrac"][k0:k1, :, :, :] = abi_vf_blk
     root["abi/present"][k0:k1, :] = abi_pres_blk
@@ -840,9 +857,13 @@ async def process_one_day(
     year, jday = day.year, int(day.strftime("%j"))
     out_zarr = merged_path(cfg.out_root, year, jday)
 
-    if zarr_exists(out_zarr) and not cfg.overwrite:
-        log(f"SKIP {day.date().isoformat()} ({year}{jday:03d}) already merged")
+    if not cfg.overwrite and zarr_is_complete(out_zarr):
+        log(f"SKIP {day.date().isoformat()} ({year}{jday:03d}) already merged (complete=true)")
         return True
+
+    if not cfg.overwrite and zarr_exists(out_zarr) and not zarr_is_complete(out_zarr):
+        log(f"RETRY {day.date().isoformat()} ({year}{jday:03d}) found partial zarr (complete!=true); rebuilding")
+        rm_tree(out_zarr)
 
     log(f"=== {day.date().isoformat()} ({year}{jday:03d}) ABI+GLM chunk-window (STRICT 5-min) ===")
 
@@ -906,7 +927,7 @@ async def process_one_day(
         log(f"!! probe failed: {repr(e)}")
         return False
 
-    # Init zarr (store goes_geos from probe)
+    # Init zarr
     try:
         root = init_zarr_store_fixed288_atomic(
             out_zarr,
@@ -1082,6 +1103,13 @@ async def process_one_day(
             log(f"{day.date().isoformat()} wrote bins {k0:03d}-{k1-1:03d} / {N_BINS-1:03d}")
 
     log(f"-> wrote merged: {out_zarr}  bins={N_BINS}  grid={y0}x{x0}")
+
+    try:
+        mark_zarr_complete(root)
+    except Exception as e:
+        log(f"!! WARNING: merged but failed to mark complete: {repr(e)}")
+        return False
+
     return True
 
 
