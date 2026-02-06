@@ -1,35 +1,55 @@
 """
-GOES ABI (CONUS L2) + GLM (LCFA) -> EXACT 288 5-min bins/day (chunk-windowed, robust)
-====================================================================================
+GOES ABI (CONUS L2) + GLM (LCFA) -> CONFIGURABLE bin aggregation (N x 5-min bins)
+================================================================================
 
 This script produces a per-day Zarr store with BOTH:
-  (A) a legacy "all-in-one" CNN tensor:   features/X[time_bin, channel, y, x]
-  (B) ML-friendly separated tensors:
+  (A) legacy CNN tensor:   features/X[time_bin, channel, y, x]
+  (B) ML-friendly tensors:
       abi/product_value[time_bin, abi_product, y, x]            float32 (NaN where invalid/missing)
       abi/valid_pixel_fraction[time_bin, abi_product, y, x]     float32 in [0,1]
       abi/bin_has_decoded_file[time_bin, abi_product]           uint8 (0/1)
 
-      glm/flash_count[time_bin, y, x]                           float32 (counts per bin on ABI grid)
+      glm/flash_count[time_bin, y, x]                           float32
       glm/bin_has_decoded_file[time_bin]                        uint8 (0/1)
       glm/files_listed_in_bin[time_bin]                         int16
       glm/files_decoded_ok_in_bin[time_bin]                     int16
 
-      grid/x_rad[x], grid/y_rad[y]                              float64 (ABI grid scan-angle radians)
-      time/bin_start_ns[time_bin], time/bin_center_ns[time_bin] int64 (ns since epoch)
-      abi/product_key[abi_product]                              str (e.g., "cmip","acha","tpw")
-      features/channel_name[channel]                            str (for legacy X)
+      validation/abi_expected_files_per_bin[time_bin, abi_product] int16
+      validation/abi_files_listed_in_bin[time_bin, abi_product]    int16
+      validation/abi_files_decoded_ok_in_bin[time_bin, abi_product]int16
+
+      validation/glm_expected_files_per_bin[time_bin]            int16
+      validation/glm_files_listed_in_bin[time_bin]               int16
+      validation/glm_files_decoded_ok_in_bin[time_bin]           int16
+
+      grid/x_scan_angle_rad[x], grid/y_scan_angle_rad[y]         float64
+      time/bin_start_ns[time_bin], time/bin_center_ns[time_bin]  int64
+      abi/product_key[abi_product]                               str
+      features/channel_name[channel]                             str
 
 Key semantics retained:
-- Always writes ALL 288 bins/day.
-- Missing ABI file => product_value=NaN, valid_pixel_fraction=0, bin_has_decoded_file=0
+- Day is partitioned into bins of width: (cfg.number_of_5min_bins_per_bin * 5 minutes).
+- Always writes ALL bins for the day.
+- Missing ABI file(s) => product_value=NaN, valid_pixel_fraction=0, bin_has_decoded_file=0
 - Missing GLM file(s) => flash_count=0, bin_has_decoded_file=0
 - GLM bin is present if ANY GLM file in that bin decodes successfully.
 
-STRICT 5-MIN WINDOW ASSIGNMENT:
-- For both ABI and GLM, assign a file to bin k (window [t0, t1)) ONLY IF:
+STRICT WINDOW ASSIGNMENT:
+- For both ABI and GLM, assign file to bin k (window [t0, t1)) ONLY IF:
     file_start >= t0  AND  file_end < t1
-- ABI: select at most one file per bin (earliest start if multiple qualify).
-- GLM: include all qualifying files per bin.
+
+ABI aggregation rule (configurable bin width):
+- Hard-coded expectation for metrics: 1 ABI file per 5-min bin.
+- Therefore expected ABI files per aggregated bin = cfg.number_of_5min_bins_per_bin * 1
+- For values written: we include ALL qualifying ABI files per aggregated bin and aggregate:
+    - value: valid_fraction-weighted mean per pixel
+    - valid_pixel_fraction: mean(valid_fraction) across decoded files
+- ABI bin is present if ANY ABI file in that bin decodes successfully.
+
+GLM aggregation rule (configurable bin width):
+- Hard-coded expectation for metrics: 15 GLM files per 5-min bin.
+- Therefore expected GLM files per aggregated bin = cfg.number_of_5min_bins_per_bin * 15
+- For values written: we include ALL qualifying GLM files per aggregated bin and SUM flash counts.
 
 PARTIAL ZARR SAFETY:
 - Zarr stores have attrs.complete=False at init.
@@ -39,9 +59,6 @@ PARTIAL ZARR SAFETY:
 NO-COARSEN OPTION:
 - cfg.coarsen_factor can be None (or 1) to disable coarsening (identity).
 
-Robust GOES filename time parser supports optional fractional digit:
-  _sYYYYJJJHHMMSSd  and  _eYYYYJJJHHMMSSd (d optional)
-
 Deps:
   pip install aiohttp netCDF4 numpy zarr pyproj
 """
@@ -50,7 +67,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 import json
 import shutil
 import asyncio
@@ -73,9 +89,9 @@ class RemoteProductSpec:
     """
     Describes how to find and decode a specific product in the GOES bucket.
     """
-    short_key: str                 # short identifier used in code ("cmip","acha","tpw","glm")
-    gcs_product_prefix: str        # product folder in GCS (e.g. "ABI-L2-CMIPC")
-    filename_must_contain: str     # substring required to match the exact variant (e.g. "...-M6C13")
+    short_key: str
+    gcs_product_prefix: str
+    filename_must_contain: str
     data_variable: str | None = None
     dqf_variable: str | None = None
 
@@ -88,6 +104,10 @@ class PipelineConfig:
     # Date range (inclusive)
     start_date_utc: str = "2025-10-16"
     end_date_utc: str = "2026-02-01"
+
+    # Bin aggregation: number of 5-min bins per output bin
+    # 1 -> 5 min, 2 -> 10 min, 3 -> 15 min, ...
+    number_of_5min_bins_per_bin: int = 2
 
     # Set to None (or 1) for NO COARSEN (identity)
     coarsen_factor: int | None = 4
@@ -104,8 +124,8 @@ class PipelineConfig:
     # Number of days processed concurrently
     max_days_in_flight: int = 3
 
-    # Time-bin window size written at once (lower = less RAM, higher = fewer writes)
-    time_bin_write_window: int = 24  # 12, 24, 48 are good
+    # Time-bin window size written at once (in OUTPUT bins, not 5-min bins)
+    time_bin_write_window: int = 24
 
     # Output
     output_root_dir: str = "./goes_abi_glm"
@@ -157,7 +177,12 @@ ABI_PRODUCT_SPECS = [ABI_CMIP_C13, ABI_ACHA_HT, ABI_TPW]
 ABI_PRODUCT_KEYS = ["cmip", "acha", "tpw"]
 NUM_ABI_PRODUCTS = 3
 
-NUM_5MIN_BINS_PER_DAY = 288
+BASE_5MIN_BINS_PER_DAY = 288
+BASE_BIN_SECONDS = 300  # 5 minutes
+
+# Validation expectations per 5-min bin (hard-coded per your request)
+EXPECTED_ABI_FILES_PER_5MIN = 1
+EXPECTED_GLM_FILES_PER_5MIN = 15
 
 # Legacy "features/X" channels (kept for backwards compatibility)
 FEATURE_CHANNEL_NAMES = np.array(
@@ -180,12 +205,6 @@ NUM_FEATURE_CHANNELS = int(FEATURE_CHANNEL_NAMES.shape[0])
 
 
 def effective_coarsen_factor() -> int:
-    """
-    Effective coarsen factor:
-      None -> 1 (no coarsen)
-      1    -> no coarsen
-      >1   -> coarsen by factor
-    """
     f = cfg.coarsen_factor
     if f is None:
         return 1
@@ -193,6 +212,30 @@ def effective_coarsen_factor() -> int:
     if f < 1:
         raise ValueError("coarsen_factor must be >= 1 (or None)")
     return f
+
+
+def bins_per_day() -> int:
+    k = int(cfg.number_of_5min_bins_per_bin)
+    if k < 1:
+        raise ValueError("number_of_5min_bins_per_bin must be >= 1")
+    if BASE_5MIN_BINS_PER_DAY % k != 0:
+        raise ValueError(
+            f"number_of_5min_bins_per_bin={k} must divide {BASE_5MIN_BINS_PER_DAY} exactly "
+            f"(valid examples: 1,2,3,4,6,8,9,12,16,18,24,32,36,48,72,96,144,288)"
+        )
+    return BASE_5MIN_BINS_PER_DAY // k
+
+
+def bin_seconds() -> int:
+    return BASE_BIN_SECONDS * int(cfg.number_of_5min_bins_per_bin)
+
+
+def expected_abi_files_per_bin() -> int:
+    return int(cfg.number_of_5min_bins_per_bin) * EXPECTED_ABI_FILES_PER_5MIN
+
+
+def expected_glm_files_per_bin() -> int:
+    return int(cfg.number_of_5min_bins_per_bin) * EXPECTED_GLM_FILES_PER_5MIN
 
 
 # =============================================================================
@@ -256,7 +299,7 @@ GOES_FILENAME_END_TIME_PATTERN   = re.compile(r"_e(\d{4})(\d{3})(\d{2})(\d{2})(\
 def _datetime_utc_from_parts(year: int, jday: int, hh: int, mm: int, ss: int, tenth: int | None) -> datetime:
     base = datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=jday - 1, hours=hh, minutes=mm, seconds=ss)
     if tenth is not None:
-        base += timedelta(milliseconds=100 * int(tenth))  # tenth-of-second -> 100 ms
+        base += timedelta(milliseconds=100 * int(tenth))
     return base
 
 
@@ -289,10 +332,14 @@ def utc_day_start(year: int, julian_day: int) -> datetime:
     return datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=julian_day - 1)
 
 
-def build_5min_bin_start_times_ns(year: int, julian_day: int) -> np.ndarray:
+def build_bin_start_times_ns(year: int, julian_day: int) -> np.ndarray:
+    """
+    Build bin start times for the configured bin width (N x 5-min).
+    """
+    n_bins = bins_per_day()
     d0 = utc_day_start(year, julian_day)
     base = np.datetime64(d0.replace(tzinfo=None), "ns")
-    return base + (np.arange(NUM_5MIN_BINS_PER_DAY, dtype=np.int64) * np.timedelta64(5, "m"))
+    return base + (np.arange(n_bins, dtype=np.int64) * np.timedelta64(bin_seconds(), "s"))
 
 
 # =============================================================================
@@ -377,61 +424,59 @@ async def list_day_objects_for_product(
 
 
 # =============================================================================
-# STRICT 5-min bin assignment
+# STRICT bin assignment (configurable bin width)
 # =============================================================================
 
-def select_one_abi_file_per_bin_strict(
-    day_start_utc: datetime,
-    file_time_triples: list[tuple[datetime, datetime, str]],
-) -> list[str | None]:
-    """
-    Strictly assign ABI files to bins [t0,t1) if (start>=t0 and end<t1).
-    Picks at most one file per bin (earliest start time if multiple qualify).
-    """
-    selected_blob_for_bin: list[str | None] = [None] * NUM_5MIN_BINS_PER_DAY
-    best_start_time_for_bin: list[datetime | None] = [None] * NUM_5MIN_BINS_PER_DAY
-
-    for file_start, file_end, blob in file_time_triples:
-        seconds_from_day_start = (file_start - day_start_utc).total_seconds()
-        bin_index = int(seconds_from_day_start // 300.0)
-        if bin_index < 0 or bin_index >= NUM_5MIN_BINS_PER_DAY:
-            continue
-
-        bin_start = day_start_utc + timedelta(seconds=300 * bin_index)
-        bin_end = bin_start + timedelta(seconds=300)
-
-        if file_start >= bin_start and file_end < bin_end:
-            prev_best = best_start_time_for_bin[bin_index]
-            if prev_best is None or file_start < prev_best:
-                best_start_time_for_bin[bin_index] = file_start
-                selected_blob_for_bin[bin_index] = blob
-
-    return selected_blob_for_bin
+def _bin_index_for_time(day_start_utc: datetime, file_start: datetime) -> int:
+    return int(((file_start - day_start_utc).total_seconds()) // float(bin_seconds()))
 
 
-def group_glm_files_into_bins_strict(
+def _bin_start_end(day_start_utc: datetime, bin_index: int) -> tuple[datetime, datetime]:
+    t0 = day_start_utc + timedelta(seconds=bin_seconds() * bin_index)
+    t1 = t0 + timedelta(seconds=bin_seconds())
+    return t0, t1
+
+
+def group_files_into_bins_strict(
     day_start_utc: datetime,
     file_time_triples: list[tuple[datetime, datetime, str]],
 ) -> list[list[str]]:
     """
-    Strictly assign GLM files to bins [t0,t1) if (start>=t0 and end<t1).
+    Strictly assign files to bins [t0,t1) if (start>=t0 and end<t1).
     Includes all qualifying files per bin.
     """
-    blobs_for_bin: list[list[str]] = [[] for _ in range(NUM_5MIN_BINS_PER_DAY)]
+    n_bins = bins_per_day()
+    blobs_for_bin: list[list[str]] = [[] for _ in range(n_bins)]
 
     for file_start, file_end, blob in file_time_triples:
-        seconds_from_day_start = (file_start - day_start_utc).total_seconds()
-        bin_index = int(seconds_from_day_start // 300.0)
-        if bin_index < 0 or bin_index >= NUM_5MIN_BINS_PER_DAY:
+        bi = _bin_index_for_time(day_start_utc, file_start)
+        if bi < 0 or bi >= n_bins:
             continue
-
-        bin_start = day_start_utc + timedelta(seconds=300 * bin_index)
-        bin_end = bin_start + timedelta(seconds=300)
-
-        if file_start >= bin_start and file_end < bin_end:
-            blobs_for_bin[bin_index].append(blob)
+        t0, t1 = _bin_start_end(day_start_utc, bi)
+        if file_start >= t0 and file_end < t1:
+            blobs_for_bin[bi].append(blob)
 
     return blobs_for_bin
+
+
+def count_listed_files_per_bin_strict(
+    day_start_utc: datetime,
+    file_time_triples: list[tuple[datetime, datetime, str]],
+) -> np.ndarray:
+    """
+    Returns int16 counts per bin for files that strictly fall into that bin.
+    """
+    n_bins = bins_per_day()
+    counts = np.zeros((n_bins,), dtype=np.int16)
+
+    for fs, fe, _ in file_time_triples:
+        bi = _bin_index_for_time(day_start_utc, fs)
+        if 0 <= bi < n_bins:
+            t0, t1 = _bin_start_end(day_start_utc, bi)
+            if fs >= t0 and fe < t1:
+                counts[bi] = np.int16(min(int(counts[bi]) + 1, 32767))
+
+    return counts
 
 
 # =============================================================================
@@ -487,9 +532,6 @@ def squeeze_to_1d(v: np.ndarray, name: str) -> np.ndarray:
 # =============================================================================
 
 def read_goes_imager_projection_attributes(payload: bytes) -> dict[str, float | str]:
-    """
-    Read GOES fixed-grid (GEOS) projection parameters from an ABI L2 file.
-    """
     import netCDF4 as nc
 
     with nc.Dataset("inmem", mode="r", memory=payload) as ds:
@@ -512,12 +554,6 @@ def read_goes_imager_projection_attributes(payload: bytes) -> dict[str, float | 
 
 
 def probe_abi_reference_grid_and_projection(payload: bytes, data_variable: str, dqf_variable: str):
-    """
-    Uses an ABI file to establish:
-      - reference raw raster shape (y_raw, x_raw)
-      - raw x/y scan-angle vectors (radians)
-      - GOES GEOS projection parameters
-    """
     import netCDF4 as nc
 
     with nc.Dataset("inmem", mode="r", memory=payload) as ds:
@@ -545,9 +581,6 @@ def build_coarsened_scan_angle_vectors(
     y_scan_angle_rad_raw: np.ndarray,
     coarsen_factor: int,
 ):
-    """
-    Coarsen scan-angle vectors by averaging blocks. If factor==1, return raw.
-    """
     if coarsen_factor == 1:
         return x_scan_angle_rad_raw.astype(np.float64, copy=False), y_scan_angle_rad_raw.astype(np.float64, copy=False)
 
@@ -571,11 +604,6 @@ def decode_abi_value_and_valid_fraction_on_reference_grid(
     reference_raw_y: int,
     reference_raw_x: int,
 ):
-    """
-    Returns:
-      - abi_value_mean_valid[y_coarse, x_coarse] (float32, NaN where no valid pixels)
-      - abi_valid_fraction[y_coarse, x_coarse]  (float32 in [0,1])
-    """
     import netCDF4 as nc
 
     with nc.Dataset("inmem", mode="r", memory=payload) as ds:
@@ -593,7 +621,6 @@ def decode_abi_value_and_valid_fraction_on_reference_grid(
             else:
                 raise ValueError(f"{dqf_variable} shape {dqf.shape} != {data_variable} shape {data.shape}")
 
-    # Normalize to reference raw shape BEFORE coarsening
     data = pad_or_crop_to_shape_2d(data, reference_raw_y, reference_raw_x, fill=np.nan)
     dqf = pad_or_crop_to_shape_2d(dqf, reference_raw_y, reference_raw_x, fill=1).astype(np.int16, copy=False)
 
@@ -603,7 +630,6 @@ def decode_abi_value_and_valid_fraction_on_reference_grid(
         mean_valid = np.where(valid, data, np.nan).astype(np.float32, copy=False)
         return mean_valid, valid_fraction
 
-    # Trim to exact multiple of coarsen_factor
     y2 = (reference_raw_y // coarsen_factor) * coarsen_factor
     x2 = (reference_raw_x // coarsen_factor) * coarsen_factor
     data = data[:y2, :x2]
@@ -613,16 +639,18 @@ def decode_abi_value_and_valid_fraction_on_reference_grid(
     y, x = data.shape
 
     data_valid_or_zero = np.where(valid, data, 0.0).astype(np.float32, copy=False)
-    sum_valid = data_valid_or_zero.reshape(y // coarsen_factor, coarsen_factor, x // coarsen_factor, coarsen_factor).sum(axis=(1, 3))
+    sum_valid = data_valid_or_zero.reshape(
+        y // coarsen_factor, coarsen_factor, x // coarsen_factor, coarsen_factor
+    ).sum(axis=(1, 3))
 
-    valid_fraction = valid.astype(np.float32, copy=False).reshape(y // coarsen_factor, coarsen_factor, x // coarsen_factor, coarsen_factor).mean(axis=(1, 3))
+    valid_fraction = valid.astype(np.float32, copy=False).reshape(
+        y // coarsen_factor, coarsen_factor, x // coarsen_factor, coarsen_factor
+    ).mean(axis=(1, 3))
 
     denom = np.maximum(valid_fraction * (coarsen_factor * coarsen_factor), 1.0).astype(np.float32, copy=False)
     mean_valid = (sum_valid / denom).astype(np.float32, copy=False)
 
-    # If no valid pixels in a block, mean should be NaN
     mean_valid = np.where(valid_fraction > 0.0, mean_valid, np.nan).astype(np.float32, copy=False)
-
     return mean_valid, valid_fraction.astype(np.float32, copy=False)
 
 
@@ -640,9 +668,6 @@ def rasterize_glm_flash_counts_to_abi_grid(
     y_scan_angle_rad_coarse: np.ndarray,
     geos_projection: dict[str, float | str],
 ):
-    """
-    Returns flash counts per ABI pixel (coarsened grid) for the GLM file.
-    """
     import netCDF4 as nc
     from pyproj import CRS, Transformer
 
@@ -689,7 +714,6 @@ def rasterize_glm_flash_counts_to_abi_grid(
     x_rad = x_rad[in_bounds]
     y_rad = y_rad[in_bounds]
 
-    # nearest-index assignment using monotonic vectors
     x_vec = x_scan_angle_rad_coarse
     x_ascending = x_vec[0] < x_vec[-1]
     if not x_ascending:
@@ -741,6 +765,8 @@ def init_daily_zarr_store_atomic(
     geos_projection: dict[str, float | str],
     coarsen_factor: int,
 ):
+    n_bins = bins_per_day()
+
     if zarr_store_exists(out_zarr_path) and not cfg.overwrite_existing:
         return zarr.open_group(out_zarr_path, mode="r+")
 
@@ -756,18 +782,23 @@ def init_daily_zarr_store_atomic(
     store = zarr.DirectoryStore(tmp_path)
     root = zarr.group(store=store, overwrite=True)
 
-    # Root-level metadata (human-readable + stable)
     root.attrs.update(
         {
-            "schema_version": "v2_ml_friendly_descriptive_names",
+            "schema_version": "v3_configurable_binwidth_abi_multi_file_agg",
             "year": year,
             "julian_day": julian_day,
             "coarsen_factor_effective": int(coarsen_factor),
-            "abi_bin_assignment_rule": "STRICT [t0,t1): file_start>=t0 and file_end<t1; choose earliest start if multiple qualify",
+            "number_of_5min_bins_per_bin": int(cfg.number_of_5min_bins_per_bin),
+            "bin_seconds": int(bin_seconds()),
+            "num_time_bins_per_day": int(n_bins),
+            "abi_bin_assignment_rule": "STRICT [t0,t1): file_start>=t0 and file_end<t1; include ALL qualifying files then aggregate",
             "glm_bin_assignment_rule": "STRICT [t0,t1): file_start>=t0 and file_end<t1; include all qualifying files",
             "missing_abi_behavior": "product_value=NaN, valid_pixel_fraction=0, bin_has_decoded_file=0",
             "missing_glm_behavior": "flash_count=0, bin_has_decoded_file=0",
-            "num_time_bins_per_day": int(NUM_5MIN_BINS_PER_DAY),
+            "validation_expected_abi_files_per_5min": int(EXPECTED_ABI_FILES_PER_5MIN),
+            "validation_expected_glm_files_per_5min": int(EXPECTED_GLM_FILES_PER_5MIN),
+            "validation_expected_abi_files_per_bin": int(expected_abi_files_per_bin()),
+            "validation_expected_glm_files_per_bin": int(expected_glm_files_per_bin()),
             "legacy_feature_tensor_channels": int(NUM_FEATURE_CHANNELS),
             "zarr_compressor": "blosc:zstd:clevel1:bitshuffle",
             "grid_shape_yx": [int(grid_y), int(grid_x)],
@@ -791,11 +822,11 @@ def init_daily_zarr_store_atomic(
     # Coordinate/label datasets
     root.create_dataset("features/channel_name", shape=(NUM_FEATURE_CHANNELS,), dtype="U32", chunks=(NUM_FEATURE_CHANNELS,), overwrite=True)[:] = FEATURE_CHANNEL_NAMES
 
-    root.create_dataset("time/bin_start_ns", shape=(NUM_5MIN_BINS_PER_DAY,), chunks=(1024,), dtype="i8", overwrite=True)[:] = (
+    root.create_dataset("time/bin_start_ns", shape=(n_bins,), chunks=(min(n_bins, 1024),), dtype="i8", overwrite=True)[:] = (
         bin_start_times_ns.astype("datetime64[ns]").astype(np.int64)
     )
-    root.create_dataset("time/bin_center_ns", shape=(NUM_5MIN_BINS_PER_DAY,), chunks=(1024,), dtype="i8", overwrite=True)[:] = (
-        (bin_start_times_ns + np.timedelta64(150, "s")).astype("datetime64[ns]").astype(np.int64)
+    root.create_dataset("time/bin_center_ns", shape=(n_bins,), chunks=(min(n_bins, 1024),), dtype="i8", overwrite=True)[:] = (
+        (bin_start_times_ns + np.timedelta64(bin_seconds() // 2, "s")).astype("datetime64[ns]").astype(np.int64)
     )
 
     root.create_dataset("abi/product_key", shape=(NUM_ABI_PRODUCTS,), chunks=(NUM_ABI_PRODUCTS,), dtype="U16", overwrite=True)[:] = np.array(
@@ -808,8 +839,8 @@ def init_daily_zarr_store_atomic(
     # Legacy monolithic tensor
     root.create_dataset(
         "features/X",
-        shape=(NUM_5MIN_BINS_PER_DAY, NUM_FEATURE_CHANNELS, grid_y, grid_x),
-        chunks=(cfg.zarr_time_chunk, NUM_FEATURE_CHANNELS, cfg.zarr_chunk_y, cfg.zarr_chunk_x),
+        shape=(n_bins, NUM_FEATURE_CHANNELS, grid_y, grid_x),
+        chunks=(min(cfg.zarr_time_chunk, n_bins), NUM_FEATURE_CHANNELS, cfg.zarr_chunk_y, cfg.zarr_chunk_x),
         dtype="f4",
         overwrite=True,
         fill_value=np.nan,
@@ -819,8 +850,8 @@ def init_daily_zarr_store_atomic(
     # ML-friendly separated tensors
     root.create_dataset(
         "abi/product_value",
-        shape=(NUM_5MIN_BINS_PER_DAY, NUM_ABI_PRODUCTS, grid_y, grid_x),
-        chunks=(cfg.zarr_time_chunk, NUM_ABI_PRODUCTS, cfg.zarr_chunk_y, cfg.zarr_chunk_x),
+        shape=(n_bins, NUM_ABI_PRODUCTS, grid_y, grid_x),
+        chunks=(min(cfg.zarr_time_chunk, n_bins), NUM_ABI_PRODUCTS, cfg.zarr_chunk_y, cfg.zarr_chunk_x),
         dtype="f4",
         overwrite=True,
         fill_value=np.nan,
@@ -828,8 +859,8 @@ def init_daily_zarr_store_atomic(
     )
     root.create_dataset(
         "abi/valid_pixel_fraction",
-        shape=(NUM_5MIN_BINS_PER_DAY, NUM_ABI_PRODUCTS, grid_y, grid_x),
-        chunks=(cfg.zarr_time_chunk, NUM_ABI_PRODUCTS, cfg.zarr_chunk_y, cfg.zarr_chunk_x),
+        shape=(n_bins, NUM_ABI_PRODUCTS, grid_y, grid_x),
+        chunks=(min(cfg.zarr_time_chunk, n_bins), NUM_ABI_PRODUCTS, cfg.zarr_chunk_y, cfg.zarr_chunk_x),
         dtype="f4",
         overwrite=True,
         fill_value=0.0,
@@ -837,8 +868,8 @@ def init_daily_zarr_store_atomic(
     )
     root.create_dataset(
         "abi/bin_has_decoded_file",
-        shape=(NUM_5MIN_BINS_PER_DAY, NUM_ABI_PRODUCTS),
-        chunks=(NUM_5MIN_BINS_PER_DAY, NUM_ABI_PRODUCTS),
+        shape=(n_bins, NUM_ABI_PRODUCTS),
+        chunks=(n_bins, NUM_ABI_PRODUCTS),
         dtype="u1",
         overwrite=True,
         fill_value=0,
@@ -847,8 +878,8 @@ def init_daily_zarr_store_atomic(
 
     root.create_dataset(
         "glm/flash_count",
-        shape=(NUM_5MIN_BINS_PER_DAY, grid_y, grid_x),
-        chunks=(cfg.zarr_time_chunk, cfg.zarr_chunk_y, cfg.zarr_chunk_x),
+        shape=(n_bins, grid_y, grid_x),
+        chunks=(min(cfg.zarr_time_chunk, n_bins), cfg.zarr_chunk_y, cfg.zarr_chunk_x),
         dtype="f4",
         overwrite=True,
         fill_value=0.0,
@@ -856,8 +887,8 @@ def init_daily_zarr_store_atomic(
     )
     root.create_dataset(
         "glm/bin_has_decoded_file",
-        shape=(NUM_5MIN_BINS_PER_DAY,),
-        chunks=(NUM_5MIN_BINS_PER_DAY,),
+        shape=(n_bins,),
+        chunks=(n_bins,),
         dtype="u1",
         overwrite=True,
         fill_value=0,
@@ -865,8 +896,8 @@ def init_daily_zarr_store_atomic(
     )
     root.create_dataset(
         "glm/files_listed_in_bin",
-        shape=(NUM_5MIN_BINS_PER_DAY,),
-        chunks=(NUM_5MIN_BINS_PER_DAY,),
+        shape=(n_bins,),
+        chunks=(n_bins,),
         dtype="i2",
         overwrite=True,
         fill_value=0,
@@ -874,88 +905,70 @@ def init_daily_zarr_store_atomic(
     )
     root.create_dataset(
         "glm/files_decoded_ok_in_bin",
-        shape=(NUM_5MIN_BINS_PER_DAY,),
-        chunks=(NUM_5MIN_BINS_PER_DAY,),
+        shape=(n_bins,),
+        chunks=(n_bins,),
         dtype="i2",
         overwrite=True,
         fill_value=0,
         compressor=compressor,
     )
 
-    # Add per-array descriptions (self-documenting Zarr)
-    root["abi/product_value"].attrs.update({
-        "description": "ABI product value on (possibly coarsened) ABI grid. Each cell is the mean of valid (DQF==0) pixels within that block. NaN where no valid pixels or file missing/failed.",
-        "dims": ["time_bin", "abi_product", "y", "x"],
-        "dtype": "float32",
-    })
-    root["abi/valid_pixel_fraction"].attrs.update({
-        "description": "Fraction of contributing raw pixels with DQF==0 within each cell/block. 0 where file missing/failed or where no pixels are valid.",
-        "dims": ["time_bin", "abi_product", "y", "x"],
-        "dtype": "float32",
-        "range": [0.0, 1.0],
-    })
-    root["abi/bin_has_decoded_file"].attrs.update({
-        "description": "1 if the selected ABI file for (time_bin,abi_product) downloaded and decoded successfully, else 0.",
-        "dims": ["time_bin", "abi_product"],
-        "dtype": "uint8",
-    })
-    root["glm/flash_count"].attrs.update({
-        "description": "GLM flash counts mapped onto ABI grid for each 5-min time bin. Sum across all GLM files strictly within the bin window. Only flashes with flash_quality_flag==0 are counted.",
-        "dims": ["time_bin", "y", "x"],
-        "dtype": "float32",
-    })
-    root["glm/bin_has_decoded_file"].attrs.update({
-        "description": "1 if any GLM file in the time bin downloaded and decoded successfully, else 0.",
-        "dims": ["time_bin"],
-        "dtype": "uint8",
-    })
-    root["glm/files_listed_in_bin"].attrs.update({
-        "description": "Number of GLM files whose start/end times place them strictly in the bin window (capped to int16).",
-        "dims": ["time_bin"],
-        "dtype": "int16",
-    })
-    root["glm/files_decoded_ok_in_bin"].attrs.update({
-        "description": "Number of GLM files in the bin that successfully decoded (capped to int16).",
-        "dims": ["time_bin"],
-        "dtype": "int16",
-    })
-    root["features/X"].attrs.update({
-        "description": "Legacy stacked feature tensor for CNNs. Channel meanings given by features/channel_name.",
-        "dims": ["time_bin", "channel", "y", "x"],
-        "dtype": "float32",
-    })
-    root["grid/x_scan_angle_rad"].attrs.update({
-        "description": "ABI fixed-grid scan-angle x coordinate (radians). Coarsened if coarsen_factor>1.",
-        "dims": ["x"],
-        "dtype": "float64",
-        "units": "radian",
-    })
-    root["grid/y_scan_angle_rad"].attrs.update({
-        "description": "ABI fixed-grid scan-angle y coordinate (radians). Coarsened if coarsen_factor>1.",
-        "dims": ["y"],
-        "dtype": "float64",
-        "units": "radian",
-    })
-    root["time/bin_start_ns"].attrs.update({
-        "description": "UTC bin start time (nanoseconds since epoch).",
-        "dims": ["time_bin"],
-        "dtype": "int64",
-    })
-    root["time/bin_center_ns"].attrs.update({
-        "description": "UTC bin center time (nanoseconds since epoch).",
-        "dims": ["time_bin"],
-        "dtype": "int64",
-    })
-    root["abi/product_key"].attrs.update({
-        "description": "Short keys for ABI products along the abi_product dimension.",
-        "dims": ["abi_product"],
-        "dtype": "str",
-    })
-    root["features/channel_name"].attrs.update({
-        "description": "Names for channels in features/X along the channel dimension.",
-        "dims": ["channel"],
-        "dtype": "str",
-    })
+    # Validation metrics
+    root.create_dataset(
+        "validation/abi_expected_files_per_bin",
+        shape=(n_bins, NUM_ABI_PRODUCTS),
+        chunks=(n_bins, NUM_ABI_PRODUCTS),
+        dtype="i2",
+        overwrite=True,
+        fill_value=np.int16(expected_abi_files_per_bin()),
+        compressor=compressor,
+    )
+    root.create_dataset(
+        "validation/abi_files_listed_in_bin",
+        shape=(n_bins, NUM_ABI_PRODUCTS),
+        chunks=(n_bins, NUM_ABI_PRODUCTS),
+        dtype="i2",
+        overwrite=True,
+        fill_value=0,
+        compressor=compressor,
+    )
+    root.create_dataset(
+        "validation/abi_files_decoded_ok_in_bin",
+        shape=(n_bins, NUM_ABI_PRODUCTS),
+        chunks=(n_bins, NUM_ABI_PRODUCTS),
+        dtype="i2",
+        overwrite=True,
+        fill_value=0,
+        compressor=compressor,
+    )
+
+    root.create_dataset(
+        "validation/glm_expected_files_per_bin",
+        shape=(n_bins,),
+        chunks=(n_bins,),
+        dtype="i2",
+        overwrite=True,
+        fill_value=np.int16(expected_glm_files_per_bin()),
+        compressor=compressor,
+    )
+    root.create_dataset(
+        "validation/glm_files_listed_in_bin",
+        shape=(n_bins,),
+        chunks=(n_bins,),
+        dtype="i2",
+        overwrite=True,
+        fill_value=0,
+        compressor=compressor,
+    )
+    root.create_dataset(
+        "validation/glm_files_decoded_ok_in_bin",
+        shape=(n_bins,),
+        chunks=(n_bins,),
+        dtype="i2",
+        overwrite=True,
+        fill_value=0,
+        compressor=compressor,
+    )
 
     # Publish atomically
     if os.path.isdir(out_zarr_path):
@@ -975,6 +988,8 @@ def _write_time_window_to_zarr(
     glm_bin_present_window: np.ndarray,
     glm_files_listed_window: np.ndarray,
     glm_files_ok_window: np.ndarray,
+    abi_files_listed_window: np.ndarray,
+    abi_files_ok_window: np.ndarray,
 ):
     window_end_bin = window_start_bin + X_window.shape[0]
 
@@ -989,10 +1004,37 @@ def _write_time_window_to_zarr(
     root["glm/files_listed_in_bin"][window_start_bin:window_end_bin] = glm_files_listed_window
     root["glm/files_decoded_ok_in_bin"][window_start_bin:window_end_bin] = glm_files_ok_window
 
+    root["validation/glm_files_listed_in_bin"][window_start_bin:window_end_bin] = glm_files_listed_window
+    root["validation/glm_files_decoded_ok_in_bin"][window_start_bin:window_end_bin] = glm_files_ok_window
+
+    root["validation/abi_files_listed_in_bin"][window_start_bin:window_end_bin, :] = abi_files_listed_window
+    root["validation/abi_files_decoded_ok_in_bin"][window_start_bin:window_end_bin, :] = abi_files_ok_window
+
 
 # =============================================================================
 # Per-day processing (chunk windows)
 # =============================================================================
+
+def _abi_accumulators(window_len: int, grid_y: int, grid_x: int):
+    # weighted sum for values + sum of weights (valid_fraction)
+    v_sum = [np.zeros((grid_y, grid_x), dtype=np.float32) for _ in range(window_len)]
+    w_sum = [np.zeros((grid_y, grid_x), dtype=np.float32) for _ in range(window_len)]
+    vf_sum = [np.zeros((grid_y, grid_x), dtype=np.float32) for _ in range(window_len)]
+    present = [np.uint8(0) for _ in range(window_len)]
+    decoded_ok = np.zeros((window_len,), dtype=np.int16)
+    return v_sum, w_sum, vf_sum, present, decoded_ok
+
+
+def _finalize_abi_bin(vsum: np.ndarray, wsum: np.ndarray, vfsum: np.ndarray, ok_count: int):
+    # value: weighted mean; NaN where no weight
+    value = np.where(wsum > 0.0, vsum / np.maximum(wsum, 1e-12), np.nan).astype(np.float32, copy=False)
+    # valid_fraction: average across decoded files
+    if ok_count > 0:
+        valid_fraction = (vfsum / float(ok_count)).astype(np.float32, copy=False)
+    else:
+        valid_fraction = np.zeros_like(vfsum, dtype=np.float32)
+    return value, valid_fraction
+
 
 async def process_single_day(
     day_utc: datetime,
@@ -1000,6 +1042,8 @@ async def process_single_day(
     http_semaphore: asyncio.Semaphore,
     decode_pool: ProcessPoolExecutor,
 ) -> bool:
+    n_bins = bins_per_day()
+
     year = day_utc.year
     julian_day = int(day_utc.strftime("%j"))
     out_zarr_path = output_zarr_path_for_day(cfg.output_root_dir, year, julian_day)
@@ -1014,13 +1058,14 @@ async def process_single_day(
 
     coarsen_factor = effective_coarsen_factor()
 
-    log(f"=== {day_utc.date().isoformat()} ({year}{julian_day:03d}) ABI+GLM chunk-window (STRICT 5-min) ===")
+    log(f"=== {day_utc.date().isoformat()} ({year}{julian_day:03d}) ABI+GLM (STRICT) bins={n_bins} bin_sec={bin_seconds()} ===")
+    log(f"bin aggregation: number_of_5min_bins_per_bin={cfg.number_of_5min_bins_per_bin} (expected ABI/bin={expected_abi_files_per_bin()} GLM/bin={expected_glm_files_per_bin()})")
     log(f"coarsen_factor: {cfg.coarsen_factor!r} -> effective={coarsen_factor}")
 
     day_start = utc_day_start(year, julian_day)
-    bin_starts_ns = build_5min_bin_start_times_ns(year, julian_day)
+    bin_starts_ns = build_bin_start_times_ns(year, julian_day)
 
-    # List all objects up-front
+    # List objects
     list_semaphore = asyncio.Semaphore(cfg.max_concurrent_list_requests)
     t_list0 = time.perf_counter()
     log("listing objects (async)...")
@@ -1036,21 +1081,35 @@ async def process_single_day(
 
     log(f"listing done in {time.perf_counter() - t_list0:.2f}s")
 
-    # Strict bin assignment
-    selected_abi_blob_by_product: dict[str, list[str | None]] = {}
+    # Strict bin assignment for BOTH: group files into bins
+    abi_blobs_in_bin_by_product: dict[str, list[list[str]]] = {}
+    abi_listed_count_by_product: dict[str, np.ndarray] = {}
+
     for spec, triples in zip(ABI_PRODUCT_SPECS, abi_file_triples_per_product):
-        selected_abi_blob_by_product[spec.short_key] = select_one_abi_file_per_bin_strict(day_start, triples) if triples else [None] * NUM_5MIN_BINS_PER_DAY
+        triples = triples or []
+        abi_blobs_in_bin_by_product[spec.short_key] = group_files_into_bins_strict(day_start, triples) if triples else [[] for _ in range(n_bins)]
+        abi_listed_count_by_product[spec.short_key] = count_listed_files_per_bin_strict(day_start, triples) if triples else np.zeros((n_bins,), dtype=np.int16)
 
-    glm_blobs_in_bin = group_glm_files_into_bins_strict(day_start, glm_file_triples) if glm_file_triples else [[] for _ in range(NUM_5MIN_BINS_PER_DAY)]
+    glm_triples = glm_file_triples or []
+    glm_blobs_in_bin = group_files_into_bins_strict(day_start, glm_triples) if glm_triples else [[] for _ in range(n_bins)]
 
-    # Probe reference ABI (shape + x/y + goes projection)
+    # GLM listed counts (validation)
+    glm_listed_counts = np.zeros((n_bins,), dtype=np.int16)
+    for bi in range(n_bins):
+        glm_listed_counts[bi] = np.int16(min(len(glm_blobs_in_bin[bi]), 32767))
+
+    # Probe reference ABI from first available ABI blob in any product/bin
     log("probing ABI reference (raw grid + scan-angle vectors + projection)...")
     probe_payload: bytes | None = None
     probe_spec: RemoteProductSpec | None = None
     probe_blob: str | None = None
 
     for spec in ABI_PRODUCT_SPECS:
-        blob = next((b for b in selected_abi_blob_by_product[spec.short_key] if b), None)
+        blob: str | None = None
+        for bin_list in abi_blobs_in_bin_by_product[spec.short_key]:
+            if bin_list:
+                blob = bin_list[0]
+                break
         if blob:
             probe_spec = spec
             probe_blob = blob
@@ -1085,7 +1144,7 @@ async def process_single_day(
         log(f"!! probe failed: {repr(e)}")
         return False
 
-    # Init Zarr (atomic publish)
+    # Init Zarr
     try:
         root = init_daily_zarr_store_atomic(
             out_zarr_path,
@@ -1101,7 +1160,6 @@ async def process_single_day(
         log(f"!! init zarr failed: {repr(e)}")
         return False
 
-    # Write scan-angle vectors once
     try:
         root["grid/x_scan_angle_rad"][:] = x_scan_angle_rad.astype(np.float64, copy=False)
         root["grid/y_scan_angle_rad"][:] = y_scan_angle_rad.astype(np.float64, copy=False)
@@ -1148,40 +1206,42 @@ async def process_single_day(
 
     ones_grid = np.ones((grid_y, grid_x), dtype=np.float32)
 
-    for window_start in range(0, NUM_5MIN_BINS_PER_DAY, cfg.time_bin_write_window):
-        window_end = min(NUM_5MIN_BINS_PER_DAY, window_start + cfg.time_bin_write_window)
+    for window_start in range(0, n_bins, cfg.time_bin_write_window):
+        window_end = min(n_bins, window_start + cfg.time_bin_write_window)
         window_len = window_end - window_start
 
-        # ABI per-product buffers
-        cmip_value = [np.full((grid_y, grid_x), np.nan, dtype=np.float32) for _ in range(window_len)]
-        acha_value = [np.full((grid_y, grid_x), np.nan, dtype=np.float32) for _ in range(window_len)]
-        tpw_value  = [np.full((grid_y, grid_x), np.nan, dtype=np.float32) for _ in range(window_len)]
-
-        cmip_valid_fraction = [np.zeros((grid_y, grid_x), dtype=np.float32) for _ in range(window_len)]
-        acha_valid_fraction = [np.zeros((grid_y, grid_x), dtype=np.float32) for _ in range(window_len)]
-        tpw_valid_fraction  = [np.zeros((grid_y, grid_x), dtype=np.float32) for _ in range(window_len)]
-
-        cmip_bin_present = [np.uint8(0) for _ in range(window_len)]
-        acha_bin_present = [np.uint8(0) for _ in range(window_len)]
-        tpw_bin_present  = [np.uint8(0) for _ in range(window_len)]
+        # ABI accumulators (multi-file agg)
+        cmip_vsum, cmip_wsum, cmip_vfsum, cmip_present, cmip_ok = _abi_accumulators(window_len, grid_y, grid_x)
+        acha_vsum, acha_wsum, acha_vfsum, acha_present, acha_ok = _abi_accumulators(window_len, grid_y, grid_x)
+        tpw_vsum,  tpw_wsum,  tpw_vfsum,  tpw_present,  tpw_ok  = _abi_accumulators(window_len, grid_y, grid_x)
 
         # GLM buffers
         glm_flash_count_sum = [np.zeros((grid_y, grid_x), dtype=np.float32) for _ in range(window_len)]
         glm_bin_present = [np.uint8(0) for _ in range(window_len)]
-
         glm_files_listed = np.zeros((window_len,), dtype=np.int16)
         glm_files_ok = np.zeros((window_len,), dtype=np.int16)
+
+        # validation ABI counts (listed, decoded ok)
+        abi_files_listed_window = np.zeros((window_len, NUM_ABI_PRODUCTS), dtype=np.int16)
+        abi_files_ok_window = np.zeros((window_len, NUM_ABI_PRODUCTS), dtype=np.int16)
+
         for bin_index in range(window_start, window_end):
             wi = bin_index - window_start
-            glm_files_listed[wi] = np.int16(min(len(glm_blobs_in_bin[bin_index]), 32767))
+            glm_files_listed[wi] = glm_listed_counts[bin_index]
+
+            # listed ABI files per product (strictly in window)
+            abi_files_listed_window[wi, 0] = np.int16(min(len(abi_blobs_in_bin_by_product["cmip"][bin_index]), 32767))
+            abi_files_listed_window[wi, 1] = np.int16(min(len(abi_blobs_in_bin_by_product["acha"][bin_index]), 32767))
+            abi_files_listed_window[wi, 2] = np.int16(min(len(abi_blobs_in_bin_by_product["tpw"][bin_index]), 32767))
 
         tasks: list[asyncio.Task] = []
         for bin_index in range(window_start, window_end):
+            # ABI: schedule ALL blobs for this bin per product
             for spec in ABI_PRODUCT_SPECS:
-                blob = selected_abi_blob_by_product[spec.short_key][bin_index]
-                if blob is not None:
+                for blob in abi_blobs_in_bin_by_product[spec.short_key][bin_index]:
                     tasks.append(asyncio.create_task(download_and_decode_abi_for_bin(bin_index, spec, blob)))
 
+            # GLM: schedule ALL blobs for this bin
             for blob in glm_blobs_in_bin[bin_index]:
                 tasks.append(asyncio.create_task(download_and_decode_glm_file_for_bin(bin_index, blob)))
 
@@ -1197,19 +1257,34 @@ async def process_single_day(
                 if not (window_start <= bin_index < window_end):
                     continue
                 wi = bin_index - window_start
+
                 if ok and value is not None and valid_fraction is not None:
+                    w = valid_fraction.astype(np.float32, copy=False)
+                    v = np.nan_to_num(value.astype(np.float32, copy=False), nan=0.0)
+
                     if short_key == "cmip":
-                        cmip_bin_present[wi] = np.uint8(1)
-                        cmip_value[wi] = value
-                        cmip_valid_fraction[wi] = valid_fraction
+                        cmip_present[wi] = np.uint8(1)
+                        cmip_vsum[wi] += v * w
+                        cmip_wsum[wi] += w
+                        cmip_vfsum[wi] += w
+                        cmip_ok[wi] = np.int16(min(int(cmip_ok[wi]) + 1, 32767))
+                        abi_files_ok_window[wi, 0] = np.int16(min(int(abi_files_ok_window[wi, 0]) + 1, 32767))
+
                     elif short_key == "acha":
-                        acha_bin_present[wi] = np.uint8(1)
-                        acha_value[wi] = value
-                        acha_valid_fraction[wi] = valid_fraction
-                    else:
-                        tpw_bin_present[wi] = np.uint8(1)
-                        tpw_value[wi] = value
-                        tpw_valid_fraction[wi] = valid_fraction
+                        acha_present[wi] = np.uint8(1)
+                        acha_vsum[wi] += v * w
+                        acha_wsum[wi] += w
+                        acha_vfsum[wi] += w
+                        acha_ok[wi] = np.int16(min(int(acha_ok[wi]) + 1, 32767))
+                        abi_files_ok_window[wi, 1] = np.int16(min(int(abi_files_ok_window[wi, 1]) + 1, 32767))
+
+                    else:  # tpw
+                        tpw_present[wi] = np.uint8(1)
+                        tpw_vsum[wi] += v * w
+                        tpw_wsum[wi] += w
+                        tpw_vfsum[wi] += w
+                        tpw_ok[wi] = np.int16(min(int(tpw_ok[wi]) + 1, 32767))
+                        abi_files_ok_window[wi, 2] = np.int16(min(int(abi_files_ok_window[wi, 2]) + 1, 32767))
 
             # GLM result tuple: (bin_index, ok, counts)
             else:
@@ -1222,6 +1297,20 @@ async def process_single_day(
                     glm_bin_present[wi] = np.uint8(1)
                     glm_files_ok[wi] = np.int16(min(int(glm_files_ok[wi]) + 1, 32767))
 
+        # Finalize ABI arrays for this window
+        cmip_value, acha_value, tpw_value = [], [], []
+        cmip_vf,    acha_vf,    tpw_vf    = [], [], []
+
+        for wi in range(window_len):
+            v, vf = _finalize_abi_bin(cmip_vsum[wi], cmip_wsum[wi], cmip_vfsum[wi], int(cmip_ok[wi]))
+            cmip_value.append(v); cmip_vf.append(vf)
+
+            v, vf = _finalize_abi_bin(acha_vsum[wi], acha_wsum[wi], acha_vfsum[wi], int(acha_ok[wi]))
+            acha_value.append(v); acha_vf.append(vf)
+
+            v, vf = _finalize_abi_bin(tpw_vsum[wi], tpw_wsum[wi], tpw_vfsum[wi], int(tpw_ok[wi]))
+            tpw_value.append(v); tpw_vf.append(vf)
+
         # Build legacy X tensor
         X_window = np.empty((window_len, NUM_FEATURE_CHANNELS, grid_y, grid_x), dtype=np.float32)
         for wi in range(window_len):
@@ -1231,20 +1320,20 @@ async def process_single_day(
                     acha_value[wi],
                     tpw_value[wi],
                     glm_flash_count_sum[wi],
-                    cmip_valid_fraction[wi],
-                    acha_valid_fraction[wi],
-                    tpw_valid_fraction[wi],
-                    ones_grid * np.float32(cmip_bin_present[wi]),
-                    ones_grid * np.float32(acha_bin_present[wi]),
-                    ones_grid * np.float32(tpw_bin_present[wi]),
+                    cmip_vf[wi],
+                    acha_vf[wi],
+                    tpw_vf[wi],
+                    ones_grid * np.float32(cmip_present[wi]),
+                    ones_grid * np.float32(acha_present[wi]),
+                    ones_grid * np.float32(tpw_present[wi]),
                     ones_grid * np.float32(glm_bin_present[wi]),
                 ],
                 axis=0,
             )
 
         abi_value_window = np.stack([cmip_value, acha_value, tpw_value], axis=1).astype(np.float32, copy=False)
-        abi_valid_fraction_window = np.stack([cmip_valid_fraction, acha_valid_fraction, tpw_valid_fraction], axis=1).astype(np.float32, copy=False)
-        abi_bin_present_window = np.stack([cmip_bin_present, acha_bin_present, tpw_bin_present], axis=1).astype(np.uint8, copy=False)
+        abi_valid_fraction_window = np.stack([cmip_vf, acha_vf, tpw_vf], axis=1).astype(np.float32, copy=False)
+        abi_bin_present_window = np.stack([cmip_present, acha_present, tpw_present], axis=1).astype(np.uint8, copy=False)
 
         glm_flash_count_window = np.stack(glm_flash_count_sum, axis=0).astype(np.float32, copy=False)
         glm_bin_present_window = np.asarray(glm_bin_present, dtype=np.uint8)
@@ -1262,15 +1351,17 @@ async def process_single_day(
             glm_bin_present_window,
             glm_files_listed,
             glm_files_ok,
+            abi_files_listed_window,
+            abi_files_ok_window,
         )
         write_seconds = time.perf_counter() - t_write0
         if write_seconds >= cfg.warn_if_write_slower_than_seconds:
             log(f"writer: WARNING slow write bins {window_start}:{window_end}  {write_seconds:.2f}s")
 
-        if window_start == 0 or (window_start // cfg.time_bin_write_window) % 2 == 0:
-            log(f"{day_utc.date().isoformat()} wrote bins {window_start:03d}-{window_end-1:03d} / {NUM_5MIN_BINS_PER_DAY-1:03d}")
+        if window_start == 0 or (window_start // max(1, cfg.time_bin_write_window)) % 2 == 0:
+            log(f"{day_utc.date().isoformat()} wrote bins {window_start:03d}-{window_end-1:03d} / {n_bins-1:03d}")
 
-    log(f"-> wrote merged: {out_zarr_path}  bins={NUM_5MIN_BINS_PER_DAY}  grid={grid_y}x{grid_x}")
+    log(f"-> wrote merged: {out_zarr_path}  bins={n_bins}  grid={grid_y}x{grid_x}")
 
     try:
         mark_zarr_store_complete(root)
@@ -1296,6 +1387,10 @@ def print_config():
 async def run_all_days():
     ensure_dir(cfg.output_root_dir)
     print_config()
+
+    # validate bin config early
+    _ = bins_per_day()
+    _ = bin_seconds()
 
     days = list(iter_days_utc(cfg.start_date_utc, cfg.end_date_utc))
     total = len(days)
@@ -1360,8 +1455,9 @@ def main():
         print("  pip install aiohttp netCDF4 numpy zarr pyproj")
         raise SystemExit(1)
 
-    # Validate coarsen factor
     _ = effective_coarsen_factor()
+    _ = bins_per_day()
+    _ = bin_seconds()
 
     asyncio.run(run_all_days())
 
