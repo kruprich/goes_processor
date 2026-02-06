@@ -1,0 +1,5 @@
+I want the following data per each individual ABI product's output pixel 
+
+
+valid pixles / expected input pixels (expected files per bin for ABI * corrison factor)
+

@@ -2,62 +2,26 @@
 GOES ABI (CONUS L2) + GLM (LCFA) -> CONFIGURABLE bin aggregation (N x 5-min bins)
 ================================================================================
 
-This script produces a per-day Zarr store with BOTH:
-  (A) legacy CNN tensor:   features/X[time_bin, channel, y, x]
-  (B) ML-friendly tensors:
-      abi/product_value[time_bin, abi_product, y, x]            float32 (NaN where invalid/missing)
-      abi/valid_pixel_fraction[time_bin, abi_product, y, x]     float32 in [0,1]
-      abi/bin_has_decoded_file[time_bin, abi_product]           uint8 (0/1)
+ABI aggregation (UPDATED as requested):
 
-      glm/flash_count[time_bin, y, x]                           float32
-      glm/bin_has_decoded_file[time_bin]                        uint8 (0/1)
-      glm/files_listed_in_bin[time_bin]                         int16
-      glm/files_decoded_ok_in_bin[time_bin]                     int16
+For each bin and ABI product:
+  - On the native (raw) grid, stack all qualifying ABI files in that bin.
+  - For each raw pixel:
+      simple mean across files, ignoring invalid samples (DQF!=0)
+      if no valid samples => NaN
+  - Then coarsen ONCE by averaging the already-aggregated raw grid (ignore NaNs).
 
-      validation/abi_expected_files_per_bin[time_bin, abi_product] int16
-      validation/abi_files_listed_in_bin[time_bin, abi_product]    int16
-      validation/abi_files_decoded_ok_in_bin[time_bin, abi_product]int16
+We also output per-coarse-pixel sample accounting:
+  validation/abi_expected_input_samples[time_bin, abi_product, y, x]   int16/int32-ish
+  validation/abi_observed_valid_samples[time_bin, abi_product, y, x]   int16/int32-ish
+  validation/abi_observed_total_samples[time_bin, abi_product, y, x]   int16/int32-ish  (decoded_ok_files * f*f)
 
-      validation/glm_expected_files_per_bin[time_bin]            int16
-      validation/glm_files_listed_in_bin[time_bin]               int16
-      validation/glm_files_decoded_ok_in_bin[time_bin]           int16
+valid_pixel_fraction definition (UPDATED):
+  = fraction of raw pixels in each coarsen block that are finite AFTER raw aggregation
+  = n_finite / (f*f)
 
-      grid/x_scan_angle_rad[x], grid/y_scan_angle_rad[y]         float64
-      time/bin_start_ns[time_bin], time/bin_center_ns[time_bin]  int64
-      abi/product_key[abi_product]                               str
-      features/channel_name[channel]                             str
-
-Key semantics retained:
-- Day is partitioned into bins of width: (cfg.number_of_5min_bins_per_bin * 5 minutes).
-- Always writes ALL bins for the day.
-- Missing ABI file(s) => product_value=NaN, valid_pixel_fraction=0, bin_has_decoded_file=0
-- Missing GLM file(s) => flash_count=0, bin_has_decoded_file=0
-- GLM bin is present if ANY GLM file in that bin decodes successfully.
-
-STRICT WINDOW ASSIGNMENT:
-- For both ABI and GLM, assign file to bin k (window [t0, t1)) ONLY IF:
-    file_start >= t0  AND  file_end < t1
-
-ABI aggregation rule (configurable bin width):
-- Hard-coded expectation for metrics: 1 ABI file per 5-min bin.
-- Therefore expected ABI files per aggregated bin = cfg.number_of_5min_bins_per_bin * 1
-- For values written: we include ALL qualifying ABI files per aggregated bin and aggregate:
-    - value: valid_fraction-weighted mean per pixel
-    - valid_pixel_fraction: mean(valid_fraction) across decoded files
-- ABI bin is present if ANY ABI file in that bin decodes successfully.
-
-GLM aggregation rule (configurable bin width):
-- Hard-coded expectation for metrics: 15 GLM files per 5-min bin.
-- Therefore expected GLM files per aggregated bin = cfg.number_of_5min_bins_per_bin * 15
-- For values written: we include ALL qualifying GLM files per aggregated bin and SUM flash counts.
-
-PARTIAL ZARR SAFETY:
-- Zarr stores have attrs.complete=False at init.
-- Only SKIP if attrs.complete==True.
-- If an existing store is partial (complete!=True), it is deleted and rebuilt.
-
-NO-COARSEN OPTION:
-- cfg.coarsen_factor can be None (or 1) to disable coarsening (identity).
+Strict bin assignment:
+  file goes to bin k iff file_start >= bin_start AND file_end < bin_end
 
 Deps:
   pip install aiohttp netCDF4 numpy zarr pyproj
@@ -86,9 +50,6 @@ from concurrent.futures import ProcessPoolExecutor
 
 @dataclass(frozen=True)
 class RemoteProductSpec:
-    """
-    Describes how to find and decode a specific product in the GOES bucket.
-    """
     short_key: str
     gcs_product_prefix: str
     filename_must_contain: str
@@ -98,45 +59,32 @@ class RemoteProductSpec:
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    # Data source
     gcs_bucket: str = "gcp-public-data-goes-19"
 
-    # Date range (inclusive)
     start_date_utc: str = "2025-10-16"
     end_date_utc: str = "2026-02-01"
 
-    # Bin aggregation: number of 5-min bins per output bin
-    # 1 -> 5 min, 2 -> 10 min, 3 -> 15 min, ...
     number_of_5min_bins_per_bin: int = 2
 
-    # Set to None (or 1) for NO COARSEN (identity)
+    # coarsen factor f: block size fxf
     coarsen_factor: int | None = 4
 
-    # HTTP download/listing behavior
     max_concurrent_http_requests: int = 32
     http_timeout_seconds: int = 60
     http_retries: int = 3
     tcp_limit_per_host: int = 96
 
-    # CPU decode worker processes
     max_decode_processes: int = 12
-
-    # Number of days processed concurrently
     max_days_in_flight: int = 3
-
-    # Time-bin window size written at once (in OUTPUT bins, not 5-min bins)
     time_bin_write_window: int = 24
 
-    # Output
     output_root_dir: str = "./goes_abi_glm"
     overwrite_existing: bool = False
 
-    # Zarr chunking (chunk across time bins)
     zarr_time_chunk: int = 16
     zarr_chunk_y: int = 256
     zarr_chunk_x: int = 256
 
-    # Listing concurrency + warning threshold
     max_concurrent_list_requests: int = 48
     warn_if_write_slower_than_seconds: float = 20.0
 
@@ -178,13 +126,11 @@ ABI_PRODUCT_KEYS = ["cmip", "acha", "tpw"]
 NUM_ABI_PRODUCTS = 3
 
 BASE_5MIN_BINS_PER_DAY = 288
-BASE_BIN_SECONDS = 300  # 5 minutes
+BASE_BIN_SECONDS = 300
 
-# Validation expectations per 5-min bin (hard-coded per your request)
 EXPECTED_ABI_FILES_PER_5MIN = 1
 EXPECTED_GLM_FILES_PER_5MIN = 15
 
-# Legacy "features/X" channels (kept for backwards compatibility)
 FEATURE_CHANNEL_NAMES = np.array(
     [
         "cmip_c13_cmi",
@@ -220,8 +166,7 @@ def bins_per_day() -> int:
         raise ValueError("number_of_5min_bins_per_bin must be >= 1")
     if BASE_5MIN_BINS_PER_DAY % k != 0:
         raise ValueError(
-            f"number_of_5min_bins_per_bin={k} must divide {BASE_5MIN_BINS_PER_DAY} exactly "
-            f"(valid examples: 1,2,3,4,6,8,9,12,16,18,24,32,36,48,72,96,144,288)"
+            f"number_of_5min_bins_per_bin={k} must divide {BASE_5MIN_BINS_PER_DAY} exactly"
         )
     return BASE_5MIN_BINS_PER_DAY // k
 
@@ -333,9 +278,6 @@ def utc_day_start(year: int, julian_day: int) -> datetime:
 
 
 def build_bin_start_times_ns(year: int, julian_day: int) -> np.ndarray:
-    """
-    Build bin start times for the configured bin width (N x 5-min).
-    """
     n_bins = bins_per_day()
     d0 = utc_day_start(year, julian_day)
     base = np.datetime64(d0.replace(tzinfo=None), "ns")
@@ -393,9 +335,6 @@ async def list_day_objects_for_product(
     julian_day: int,
     list_request_semaphore: asyncio.Semaphore,
 ) -> list[tuple[datetime, datetime, str]]:
-    """
-    Returns [(file_start_utc, file_end_utc, blob_name), ...] for that product+day.
-    """
     prefixes = [f"{product_spec.gcs_product_prefix}/{year}/{julian_day:03d}/{hh:02d}/" for hh in range(24)]
     tasks = [
         asyncio.create_task(_gcs_list_object_names_http(session, cfg.gcs_bucket, pfx, list_request_semaphore))
@@ -424,7 +363,7 @@ async def list_day_objects_for_product(
 
 
 # =============================================================================
-# STRICT bin assignment (configurable bin width)
+# STRICT bin assignment
 # =============================================================================
 
 def _bin_index_for_time(day_start_utc: datetime, file_start: datetime) -> int:
@@ -441,10 +380,6 @@ def group_files_into_bins_strict(
     day_start_utc: datetime,
     file_time_triples: list[tuple[datetime, datetime, str]],
 ) -> list[list[str]]:
-    """
-    Strictly assign files to bins [t0,t1) if (start>=t0 and end<t1).
-    Includes all qualifying files per bin.
-    """
     n_bins = bins_per_day()
     blobs_for_bin: list[list[str]] = [[] for _ in range(n_bins)]
 
@@ -457,26 +392,6 @@ def group_files_into_bins_strict(
             blobs_for_bin[bi].append(blob)
 
     return blobs_for_bin
-
-
-def count_listed_files_per_bin_strict(
-    day_start_utc: datetime,
-    file_time_triples: list[tuple[datetime, datetime, str]],
-) -> np.ndarray:
-    """
-    Returns int16 counts per bin for files that strictly fall into that bin.
-    """
-    n_bins = bins_per_day()
-    counts = np.zeros((n_bins,), dtype=np.int16)
-
-    for fs, fe, _ in file_time_triples:
-        bi = _bin_index_for_time(day_start_utc, fs)
-        if 0 <= bi < n_bins:
-            t0, t1 = _bin_start_end(day_start_utc, bi)
-            if fs >= t0 and fe < t1:
-                counts[bi] = np.int16(min(int(counts[bi]) + 1, 32767))
-
-    return counts
 
 
 # =============================================================================
@@ -500,7 +415,7 @@ async def download_gcs_object_bytes(session: aiohttp.ClientSession, blob_name: s
 
 
 # =============================================================================
-# Array shape helpers
+# Array helpers
 # =============================================================================
 
 def pad_or_crop_to_shape_2d(a: np.ndarray, target_y: int, target_x: int, *, fill: float) -> np.ndarray:
@@ -528,7 +443,7 @@ def squeeze_to_1d(v: np.ndarray, name: str) -> np.ndarray:
 
 
 # =============================================================================
-# ABI probe + decode
+# ABI probe + projection
 # =============================================================================
 
 def read_goes_imager_projection_attributes(payload: bytes) -> dict[str, float | str]:
@@ -576,34 +491,30 @@ def probe_abi_reference_grid_and_projection(payload: bytes, data_variable: str, 
     return raw_y, raw_x, x_scan_angle_rad, y_scan_angle_rad, geos_projection
 
 
-def build_coarsened_scan_angle_vectors(
-    x_scan_angle_rad_raw: np.ndarray,
-    y_scan_angle_rad_raw: np.ndarray,
-    coarsen_factor: int,
-):
-    if coarsen_factor == 1:
-        return x_scan_angle_rad_raw.astype(np.float64, copy=False), y_scan_angle_rad_raw.astype(np.float64, copy=False)
+def build_coarsened_scan_angle_vectors(x_raw: np.ndarray, y_raw: np.ndarray, f: int):
+    if f == 1:
+        return x_raw.astype(np.float64, copy=False), y_raw.astype(np.float64, copy=False)
 
-    def trim_to_multiple(v: np.ndarray):
-        n2 = (v.shape[0] // coarsen_factor) * coarsen_factor
+    def trim(v: np.ndarray):
+        n2 = (v.shape[0] // f) * f
         return v[:n2]
 
-    x = trim_to_multiple(x_scan_angle_rad_raw)
-    y = trim_to_multiple(y_scan_angle_rad_raw)
-
-    x_c = x.reshape(x.shape[0] // coarsen_factor, coarsen_factor).mean(axis=1)
-    y_c = y.reshape(y.shape[0] // coarsen_factor, coarsen_factor).mean(axis=1)
+    x = trim(x_raw)
+    y = trim(y_raw)
+    x_c = x.reshape(x.shape[0] // f, f).mean(axis=1)
+    y_c = y.reshape(y.shape[0] // f, f).mean(axis=1)
     return x_c.astype(np.float64), y_c.astype(np.float64)
 
 
-def decode_abi_value_and_valid_fraction_on_reference_grid(
-    payload: bytes,
-    data_variable: str,
-    dqf_variable: str,
-    coarsen_factor: int,
-    reference_raw_y: int,
-    reference_raw_x: int,
-):
+# =============================================================================
+# ABI decode (raw) + per-bin reduce + coarsen
+# =============================================================================
+
+def _read_abi_raw_data_and_valid_mask(payload: bytes, data_variable: str, dqf_variable: str, reference_raw_y: int, reference_raw_x: int):
+    """
+    Returns (data_raw, valid_mask_raw) both shaped (reference_raw_y, reference_raw_x).
+    valid_mask_raw True where DQF==0.
+    """
     import netCDF4 as nc
 
     with nc.Dataset("inmem", mode="r", memory=payload) as ds:
@@ -622,40 +533,69 @@ def decode_abi_value_and_valid_fraction_on_reference_grid(
                 raise ValueError(f"{dqf_variable} shape {dqf.shape} != {data_variable} shape {data.shape}")
 
     data = pad_or_crop_to_shape_2d(data, reference_raw_y, reference_raw_x, fill=np.nan)
-    dqf = pad_or_crop_to_shape_2d(dqf, reference_raw_y, reference_raw_x, fill=1).astype(np.int16, copy=False)
-
-    if coarsen_factor == 1:
-        valid = (dqf == 0)
-        valid_fraction = valid.astype(np.float32, copy=False)
-        mean_valid = np.where(valid, data, np.nan).astype(np.float32, copy=False)
-        return mean_valid, valid_fraction
-
-    y2 = (reference_raw_y // coarsen_factor) * coarsen_factor
-    x2 = (reference_raw_x // coarsen_factor) * coarsen_factor
-    data = data[:y2, :x2]
-    dqf = dqf[:y2, :x2]
+    dqf  = pad_or_crop_to_shape_2d(dqf,  reference_raw_y, reference_raw_x, fill=1).astype(np.int16, copy=False)
 
     valid = (dqf == 0)
-    y, x = data.shape
-
-    data_valid_or_zero = np.where(valid, data, 0.0).astype(np.float32, copy=False)
-    sum_valid = data_valid_or_zero.reshape(
-        y // coarsen_factor, coarsen_factor, x // coarsen_factor, coarsen_factor
-    ).sum(axis=(1, 3))
-
-    valid_fraction = valid.astype(np.float32, copy=False).reshape(
-        y // coarsen_factor, coarsen_factor, x // coarsen_factor, coarsen_factor
-    ).mean(axis=(1, 3))
-
-    denom = np.maximum(valid_fraction * (coarsen_factor * coarsen_factor), 1.0).astype(np.float32, copy=False)
-    mean_valid = (sum_valid / denom).astype(np.float32, copy=False)
-
-    mean_valid = np.where(valid_fraction > 0.0, mean_valid, np.nan).astype(np.float32, copy=False)
-    return mean_valid, valid_fraction.astype(np.float32, copy=False)
+    return data, valid
 
 
-def _decode_abi_worker(payload: bytes, data_variable: str, dqf_variable: str, coarsen_factor: int, reference_raw_y: int, reference_raw_x: int):
-    return decode_abi_value_and_valid_fraction_on_reference_grid(payload, data_variable, dqf_variable, coarsen_factor, reference_raw_y, reference_raw_x)
+def _coarsen_mean_ignore_nan(raw_mean: np.ndarray, f: int):
+    """
+    raw_mean: (raw_y, raw_x) float32 with NaNs where invalid
+    returns:
+      coarse_value: (raw_y//f, raw_x//f) mean ignoring NaN
+      coarse_valid_pixel_fraction: fraction of raw pixels in block that are finite
+    """
+    if f == 1:
+        finite = np.isfinite(raw_mean)
+        vf = finite.astype(np.float32)
+        return raw_mean.astype(np.float32, copy=False), vf
+
+    y2 = (raw_mean.shape[0] // f) * f
+    x2 = (raw_mean.shape[1] // f) * f
+    a = raw_mean[:y2, :x2].astype(np.float32, copy=False)
+
+    finite = np.isfinite(a)
+    count = finite.reshape(y2 // f, f, x2 // f, f).sum(axis=(1, 3)).astype(np.float32, copy=False)
+
+    a0 = np.where(finite, a, 0.0).astype(np.float32, copy=False)
+    s = a0.reshape(y2 // f, f, x2 // f, f).sum(axis=(1, 3)).astype(np.float32, copy=False)
+
+    denom = np.maximum(count, 1.0)
+    mean = (s / denom).astype(np.float32, copy=False)
+    mean = np.where(count > 0, mean, np.nan).astype(np.float32, copy=False)
+
+    vf = (count / float(f * f)).astype(np.float32, copy=False)
+    return mean, vf
+
+
+def _coarsen_sum_int(raw_count: np.ndarray, f: int):
+    """
+    raw_count: (raw_y, raw_x) int16/int32 counts per raw pixel
+    returns coarse sum per block
+    """
+    if f == 1:
+        return raw_count
+    y2 = (raw_count.shape[0] // f) * f
+    x2 = (raw_count.shape[1] // f) * f
+    a = raw_count[:y2, :x2]
+    return a.reshape(y2 // f, f, x2 // f, f).sum(axis=(1, 3))
+
+
+def decode_abi_file_to_raw_contrib(payload: bytes, data_variable: str, dqf_variable: str, reference_raw_y: int, reference_raw_x: int):
+    """
+    Returns:
+      raw_sum_valid: float32 (raw_y, raw_x)  (value where valid else 0)
+      raw_count_valid: int16 (raw_y, raw_x) (1 where valid else 0)
+    """
+    data, valid = _read_abi_raw_data_and_valid_mask(payload, data_variable, dqf_variable, reference_raw_y, reference_raw_x)
+    v = np.where(valid, data, 0.0).astype(np.float32, copy=False)
+    c = valid.astype(np.int16, copy=False)
+    return v, c
+
+
+def _decode_abi_worker(payload: bytes, data_variable: str, dqf_variable: str, reference_raw_y: int, reference_raw_x: int):
+    return decode_abi_file_to_raw_contrib(payload, data_variable, dqf_variable, reference_raw_y, reference_raw_x)
 
 
 # =============================================================================
@@ -752,7 +692,7 @@ def _decode_glm_worker(payload: bytes, x_scan_angle_rad_coarse: np.ndarray, y_sc
 
 
 # =============================================================================
-# Zarr init (atomic tmp publish) + metadata
+# Zarr init
 # =============================================================================
 
 def init_daily_zarr_store_atomic(
@@ -784,14 +724,15 @@ def init_daily_zarr_store_atomic(
 
     root.attrs.update(
         {
-            "schema_version": "v3_configurable_binwidth_abi_multi_file_agg",
+            "schema_version": "v4_raw_stack_mean_then_coarsen",
             "year": year,
             "julian_day": julian_day,
             "coarsen_factor_effective": int(coarsen_factor),
             "number_of_5min_bins_per_bin": int(cfg.number_of_5min_bins_per_bin),
             "bin_seconds": int(bin_seconds()),
             "num_time_bins_per_day": int(n_bins),
-            "abi_bin_assignment_rule": "STRICT [t0,t1): file_start>=t0 and file_end<t1; include ALL qualifying files then aggregate",
+            "abi_bin_assignment_rule": "STRICT [t0,t1): file_start>=t0 and file_end<t1; include ALL qualifying files",
+            "abi_aggregation_rule": "RAW grid mean across files ignoring DQF!=0; then coarsen mean ignoring NaN",
             "glm_bin_assignment_rule": "STRICT [t0,t1): file_start>=t0 and file_end<t1; include all qualifying files",
             "missing_abi_behavior": "product_value=NaN, valid_pixel_fraction=0, bin_has_decoded_file=0",
             "missing_glm_behavior": "flash_count=0, bin_has_decoded_file=0",
@@ -819,7 +760,6 @@ def init_daily_zarr_store_atomic(
         }
     )
 
-    # Coordinate/label datasets
     root.create_dataset("features/channel_name", shape=(NUM_FEATURE_CHANNELS,), dtype="U32", chunks=(NUM_FEATURE_CHANNELS,), overwrite=True)[:] = FEATURE_CHANNEL_NAMES
 
     root.create_dataset("time/bin_start_ns", shape=(n_bins,), chunks=(min(n_bins, 1024),), dtype="i8", overwrite=True)[:] = (
@@ -836,7 +776,6 @@ def init_daily_zarr_store_atomic(
     root.create_dataset("grid/x_scan_angle_rad", shape=(grid_x,), chunks=(min(grid_x, 4096),), dtype="f8", overwrite=True)
     root.create_dataset("grid/y_scan_angle_rad", shape=(grid_y,), chunks=(min(grid_y, 4096),), dtype="f8", overwrite=True)
 
-    # Legacy monolithic tensor
     root.create_dataset(
         "features/X",
         shape=(n_bins, NUM_FEATURE_CHANNELS, grid_y, grid_x),
@@ -847,7 +786,6 @@ def init_daily_zarr_store_atomic(
         compressor=compressor,
     )
 
-    # ML-friendly separated tensors
     root.create_dataset(
         "abi/product_value",
         shape=(n_bins, NUM_ABI_PRODUCTS, grid_y, grid_x),
@@ -871,6 +809,36 @@ def init_daily_zarr_store_atomic(
         shape=(n_bins, NUM_ABI_PRODUCTS),
         chunks=(n_bins, NUM_ABI_PRODUCTS),
         dtype="u1",
+        overwrite=True,
+        fill_value=0,
+        compressor=compressor,
+    )
+
+    # NEW: per-coarse-pixel sample accounting
+    # Use int32 to avoid overflow for large windows/files (safer than int16).
+    root.create_dataset(
+        "validation/abi_expected_input_samples",
+        shape=(n_bins, NUM_ABI_PRODUCTS, grid_y, grid_x),
+        chunks=(min(cfg.zarr_time_chunk, n_bins), 1, cfg.zarr_chunk_y, cfg.zarr_chunk_x),
+        dtype="i4",
+        overwrite=True,
+        fill_value=0,
+        compressor=compressor,
+    )
+    root.create_dataset(
+        "validation/abi_observed_valid_samples",
+        shape=(n_bins, NUM_ABI_PRODUCTS, grid_y, grid_x),
+        chunks=(min(cfg.zarr_time_chunk, n_bins), 1, cfg.zarr_chunk_y, cfg.zarr_chunk_x),
+        dtype="i4",
+        overwrite=True,
+        fill_value=0,
+        compressor=compressor,
+    )
+    root.create_dataset(
+        "validation/abi_observed_total_samples",
+        shape=(n_bins, NUM_ABI_PRODUCTS, grid_y, grid_x),
+        chunks=(min(cfg.zarr_time_chunk, n_bins), 1, cfg.zarr_chunk_y, cfg.zarr_chunk_x),
+        dtype="i4",
         overwrite=True,
         fill_value=0,
         compressor=compressor,
@@ -913,7 +881,6 @@ def init_daily_zarr_store_atomic(
         compressor=compressor,
     )
 
-    # Validation metrics
     root.create_dataset(
         "validation/abi_expected_files_per_bin",
         shape=(n_bins, NUM_ABI_PRODUCTS),
@@ -970,7 +937,6 @@ def init_daily_zarr_store_atomic(
         compressor=compressor,
     )
 
-    # Publish atomically
     if os.path.isdir(out_zarr_path):
         remove_directory_tree(out_zarr_path)
     shutil.move(tmp_path, out_zarr_path)
@@ -990,6 +956,9 @@ def _write_time_window_to_zarr(
     glm_files_ok_window: np.ndarray,
     abi_files_listed_window: np.ndarray,
     abi_files_ok_window: np.ndarray,
+    abi_expected_samples_window: np.ndarray,
+    abi_observed_valid_samples_window: np.ndarray,
+    abi_observed_total_samples_window: np.ndarray,
 ):
     window_end_bin = window_start_bin + X_window.shape[0]
 
@@ -1010,31 +979,14 @@ def _write_time_window_to_zarr(
     root["validation/abi_files_listed_in_bin"][window_start_bin:window_end_bin, :] = abi_files_listed_window
     root["validation/abi_files_decoded_ok_in_bin"][window_start_bin:window_end_bin, :] = abi_files_ok_window
 
+    root["validation/abi_expected_input_samples"][window_start_bin:window_end_bin, :, :, :] = abi_expected_samples_window
+    root["validation/abi_observed_valid_samples"][window_start_bin:window_end_bin, :, :, :] = abi_observed_valid_samples_window
+    root["validation/abi_observed_total_samples"][window_start_bin:window_end_bin, :, :, :] = abi_observed_total_samples_window
+
 
 # =============================================================================
-# Per-day processing (chunk windows)
+# Per-day processing
 # =============================================================================
-
-def _abi_accumulators(window_len: int, grid_y: int, grid_x: int):
-    # weighted sum for values + sum of weights (valid_fraction)
-    v_sum = [np.zeros((grid_y, grid_x), dtype=np.float32) for _ in range(window_len)]
-    w_sum = [np.zeros((grid_y, grid_x), dtype=np.float32) for _ in range(window_len)]
-    vf_sum = [np.zeros((grid_y, grid_x), dtype=np.float32) for _ in range(window_len)]
-    present = [np.uint8(0) for _ in range(window_len)]
-    decoded_ok = np.zeros((window_len,), dtype=np.int16)
-    return v_sum, w_sum, vf_sum, present, decoded_ok
-
-
-def _finalize_abi_bin(vsum: np.ndarray, wsum: np.ndarray, vfsum: np.ndarray, ok_count: int):
-    # value: weighted mean; NaN where no weight
-    value = np.where(wsum > 0.0, vsum / np.maximum(wsum, 1e-12), np.nan).astype(np.float32, copy=False)
-    # valid_fraction: average across decoded files
-    if ok_count > 0:
-        valid_fraction = (vfsum / float(ok_count)).astype(np.float32, copy=False)
-    else:
-        valid_fraction = np.zeros_like(vfsum, dtype=np.float32)
-    return value, valid_fraction
-
 
 async def process_single_day(
     day_utc: datetime,
@@ -1043,7 +995,6 @@ async def process_single_day(
     decode_pool: ProcessPoolExecutor,
 ) -> bool:
     n_bins = bins_per_day()
-
     year = day_utc.year
     julian_day = int(day_utc.strftime("%j"))
     out_zarr_path = output_zarr_path_for_day(cfg.output_root_dir, year, julian_day)
@@ -1053,22 +1004,18 @@ async def process_single_day(
         return True
 
     if (not cfg.overwrite_existing) and zarr_store_exists(out_zarr_path) and (not zarr_store_is_complete(out_zarr_path)):
-        log(f"RETRY {day_utc.date().isoformat()} ({year}{julian_day:03d}) found partial zarr (complete!=true); rebuilding")
+        log(f"RETRY {day_utc.date().isoformat()} ({year}{julian_day:03d}) partial zarr; rebuilding")
         remove_directory_tree(out_zarr_path)
 
-    coarsen_factor = effective_coarsen_factor()
-
-    log(f"=== {day_utc.date().isoformat()} ({year}{julian_day:03d}) ABI+GLM (STRICT) bins={n_bins} bin_sec={bin_seconds()} ===")
-    log(f"bin aggregation: number_of_5min_bins_per_bin={cfg.number_of_5min_bins_per_bin} (expected ABI/bin={expected_abi_files_per_bin()} GLM/bin={expected_glm_files_per_bin()})")
-    log(f"coarsen_factor: {cfg.coarsen_factor!r} -> effective={coarsen_factor}")
+    f = effective_coarsen_factor()
+    log(f"=== {day_utc.date().isoformat()} ({year}{julian_day:03d}) ABI+GLM bins={n_bins} bin_sec={bin_seconds()} coarsen_f={f} ===")
 
     day_start = utc_day_start(year, julian_day)
     bin_starts_ns = build_bin_start_times_ns(year, julian_day)
 
-    # List objects
     list_semaphore = asyncio.Semaphore(cfg.max_concurrent_list_requests)
-    t_list0 = time.perf_counter()
     log("listing objects (async)...")
+    t_list0 = time.perf_counter()
 
     abi_list_tasks = [
         asyncio.create_task(list_day_objects_for_product(session, spec, year, julian_day, list_semaphore))
@@ -1078,68 +1025,51 @@ async def process_single_day(
 
     abi_file_triples_per_product = await asyncio.gather(*abi_list_tasks)
     glm_file_triples = await glm_list_task
-
     log(f"listing done in {time.perf_counter() - t_list0:.2f}s")
 
-    # Strict bin assignment for BOTH: group files into bins
     abi_blobs_in_bin_by_product: dict[str, list[list[str]]] = {}
-    abi_listed_count_by_product: dict[str, np.ndarray] = {}
-
     for spec, triples in zip(ABI_PRODUCT_SPECS, abi_file_triples_per_product):
         triples = triples or []
         abi_blobs_in_bin_by_product[spec.short_key] = group_files_into_bins_strict(day_start, triples) if triples else [[] for _ in range(n_bins)]
-        abi_listed_count_by_product[spec.short_key] = count_listed_files_per_bin_strict(day_start, triples) if triples else np.zeros((n_bins,), dtype=np.int16)
 
     glm_triples = glm_file_triples or []
     glm_blobs_in_bin = group_files_into_bins_strict(day_start, glm_triples) if glm_triples else [[] for _ in range(n_bins)]
+    glm_listed_counts = np.array([min(len(x), 32767) for x in glm_blobs_in_bin], dtype=np.int16)
 
-    # GLM listed counts (validation)
-    glm_listed_counts = np.zeros((n_bins,), dtype=np.int16)
-    for bi in range(n_bins):
-        glm_listed_counts[bi] = np.int16(min(len(glm_blobs_in_bin[bi]), 32767))
-
-    # Probe reference ABI from first available ABI blob in any product/bin
-    log("probing ABI reference (raw grid + scan-angle vectors + projection)...")
-    probe_payload: bytes | None = None
-    probe_spec: RemoteProductSpec | None = None
-    probe_blob: str | None = None
+    # Probe reference ABI
+    log("probing ABI reference...")
+    probe_payload = None
+    probe_spec = None
+    probe_blob = None
 
     for spec in ABI_PRODUCT_SPECS:
-        blob: str | None = None
         for bin_list in abi_blobs_in_bin_by_product[spec.short_key]:
             if bin_list:
-                blob = bin_list[0]
-                break
-        if blob:
-            probe_spec = spec
-            probe_blob = blob
-            async with http_semaphore:
-                probe_payload = await download_gcs_object_bytes(session, blob)
-            if probe_payload:
-                break
+                probe_blob = bin_list[0]
+                probe_spec = spec
+                async with http_semaphore:
+                    probe_payload = await download_gcs_object_bytes(session, probe_blob)
+                if probe_payload:
+                    break
+        if probe_payload:
+            break
 
     if probe_payload is None or probe_spec is None:
         log("!! no ABI probe downloadable; skipping day")
         return False
 
     try:
-        reference_raw_y, reference_raw_x, x_scan_angle_rad_raw, y_scan_angle_rad_raw, geos_projection = probe_abi_reference_grid_and_projection(
+        raw_y, raw_x, x_raw, y_raw, geos_projection = probe_abi_reference_grid_and_projection(
             probe_payload,
             probe_spec.data_variable,  # type: ignore[arg-type]
             probe_spec.dqf_variable,   # type: ignore[arg-type]
         )
-        x_scan_angle_rad, y_scan_angle_rad = build_coarsened_scan_angle_vectors(x_scan_angle_rad_raw, y_scan_angle_rad_raw, coarsen_factor)
+        x_scan_angle_rad, y_scan_angle_rad = build_coarsened_scan_angle_vectors(x_raw, y_raw, f)
 
         grid_y = int(y_scan_angle_rad.shape[0])
         grid_x = int(x_scan_angle_rad.shape[0])
 
-        log(
-            f"probe OK: raw={reference_raw_y}x{reference_raw_x} -> grid={grid_y}x{grid_x} "
-            f"lon0={geos_projection['projection_origin_longitude_deg']} "
-            f"h={geos_projection['perspective_point_height_m']} "
-            f"sweep={geos_projection['sweep_angle_axis']} "
-            f"({os.path.basename(probe_blob or '')})"
-        )
+        log(f"probe OK: raw={raw_y}x{raw_x} -> coarse grid={grid_y}x{grid_x} ({os.path.basename(probe_blob or '')})")
     except Exception as e:
         log(f"!! probe failed: {repr(e)}")
         return False
@@ -1154,7 +1084,7 @@ async def process_single_day(
             julian_day=julian_day,
             bin_start_times_ns=bin_starts_ns,
             geos_projection=geos_projection,
-            coarsen_factor=coarsen_factor,
+            coarsen_factor=f,
         )
     except Exception as e:
         log(f"!! init zarr failed: {repr(e)}")
@@ -1168,26 +1098,23 @@ async def process_single_day(
 
     loop = asyncio.get_running_loop()
 
-    async def download_and_decode_abi_for_bin(bin_index: int, spec: RemoteProductSpec, blob: str):
+    async def download_and_decode_abi_raw_contrib(bin_index: int, spec: RemoteProductSpec, blob: str):
         async with http_semaphore:
             payload = await download_gcs_object_bytes(session, blob)
         if payload is None:
             return (bin_index, spec.short_key, False, None, None)
 
         try:
-            value, valid_fraction = await loop.run_in_executor(
+            raw_sum, raw_count = await loop.run_in_executor(
                 decode_pool,
                 _decode_abi_worker,
                 payload,
                 spec.data_variable,
                 spec.dqf_variable,
-                coarsen_factor,
-                reference_raw_y,
-                reference_raw_x,
+                raw_y,
+                raw_x,
             )  # type: ignore[arg-type]
-            value = pad_or_crop_to_shape_2d(value.astype(np.float32, copy=False), grid_y, grid_x, fill=np.nan)
-            valid_fraction = pad_or_crop_to_shape_2d(valid_fraction.astype(np.float32, copy=False), grid_y, grid_x, fill=0.0)
-            return (bin_index, spec.short_key, True, value, valid_fraction)
+            return (bin_index, spec.short_key, True, raw_sum, raw_count)
         except Exception:
             return (bin_index, spec.short_key, False, None, None)
 
@@ -1199,144 +1126,160 @@ async def process_single_day(
 
         try:
             counts = await loop.run_in_executor(decode_pool, _decode_glm_worker, payload, x_scan_angle_rad, y_scan_angle_rad, geos_projection)
-            counts = pad_or_crop_to_shape_2d(counts.astype(np.float32, copy=False), grid_y, grid_x, fill=0.0)
             return (bin_index, True, counts)
         except Exception:
             return (bin_index, False, None)
 
     ones_grid = np.ones((grid_y, grid_x), dtype=np.float32)
+    expected_samples_per_output_pixel = int(expected_abi_files_per_bin() * (f * f))
 
     for window_start in range(0, n_bins, cfg.time_bin_write_window):
         window_end = min(n_bins, window_start + cfg.time_bin_write_window)
         window_len = window_end - window_start
 
-        # ABI accumulators (multi-file agg)
-        cmip_vsum, cmip_wsum, cmip_vfsum, cmip_present, cmip_ok = _abi_accumulators(window_len, grid_y, grid_x)
-        acha_vsum, acha_wsum, acha_vfsum, acha_present, acha_ok = _abi_accumulators(window_len, grid_y, grid_x)
-        tpw_vsum,  tpw_wsum,  tpw_vfsum,  tpw_present,  tpw_ok  = _abi_accumulators(window_len, grid_y, grid_x)
+        # Per-window outputs (coarse)
+        abi_value_window = np.full((window_len, NUM_ABI_PRODUCTS, grid_y, grid_x), np.nan, dtype=np.float32)
+        abi_vf_window    = np.zeros((window_len, NUM_ABI_PRODUCTS, grid_y, grid_x), dtype=np.float32)
+        abi_present_win  = np.zeros((window_len, NUM_ABI_PRODUCTS), dtype=np.uint8)
 
-        # GLM buffers
-        glm_flash_count_sum = [np.zeros((grid_y, grid_x), dtype=np.float32) for _ in range(window_len)]
-        glm_bin_present = [np.uint8(0) for _ in range(window_len)]
+        abi_expected_samples_win = np.zeros((window_len, NUM_ABI_PRODUCTS, grid_y, grid_x), dtype=np.int32)
+        abi_obs_valid_samples_win = np.zeros((window_len, NUM_ABI_PRODUCTS, grid_y, grid_x), dtype=np.int32)
+        abi_obs_total_samples_win = np.zeros((window_len, NUM_ABI_PRODUCTS, grid_y, grid_x), dtype=np.int32)
+
+        # GLM window
+        glm_flash_count_sum = np.zeros((window_len, grid_y, grid_x), dtype=np.float32)
+        glm_bin_present = np.zeros((window_len,), dtype=np.uint8)
         glm_files_listed = np.zeros((window_len,), dtype=np.int16)
         glm_files_ok = np.zeros((window_len,), dtype=np.int16)
 
-        # validation ABI counts (listed, decoded ok)
+        # Validation per-bin counts
         abi_files_listed_window = np.zeros((window_len, NUM_ABI_PRODUCTS), dtype=np.int16)
         abi_files_ok_window = np.zeros((window_len, NUM_ABI_PRODUCTS), dtype=np.int16)
 
+        # Raw accumulators for ABI in this window, per product, per bin
+        # Store as dict: (wi -> (raw_sum, raw_count, ok_files))
+        raw_acc = {
+            "cmip": [(np.zeros((raw_y, raw_x), dtype=np.float32), np.zeros((raw_y, raw_x), dtype=np.int32), 0) for _ in range(window_len)],
+            "acha": [(np.zeros((raw_y, raw_x), dtype=np.float32), np.zeros((raw_y, raw_x), dtype=np.int32), 0) for _ in range(window_len)],
+            "tpw":  [(np.zeros((raw_y, raw_x), dtype=np.float32), np.zeros((raw_y, raw_x), dtype=np.int32), 0) for _ in range(window_len)],
+        }
+
         for bin_index in range(window_start, window_end):
             wi = bin_index - window_start
+
             glm_files_listed[wi] = glm_listed_counts[bin_index]
 
-            # listed ABI files per product (strictly in window)
             abi_files_listed_window[wi, 0] = np.int16(min(len(abi_blobs_in_bin_by_product["cmip"][bin_index]), 32767))
             abi_files_listed_window[wi, 1] = np.int16(min(len(abi_blobs_in_bin_by_product["acha"][bin_index]), 32767))
             abi_files_listed_window[wi, 2] = np.int16(min(len(abi_blobs_in_bin_by_product["tpw"][bin_index]), 32767))
 
+            # expected input samples per output pixel (constant given config)
+            abi_expected_samples_win[wi, :, :, :] = expected_samples_per_output_pixel
+
+        # Schedule downloads/decodes
         tasks: list[asyncio.Task] = []
         for bin_index in range(window_start, window_end):
-            # ABI: schedule ALL blobs for this bin per product
             for spec in ABI_PRODUCT_SPECS:
                 for blob in abi_blobs_in_bin_by_product[spec.short_key][bin_index]:
-                    tasks.append(asyncio.create_task(download_and_decode_abi_for_bin(bin_index, spec, blob)))
+                    tasks.append(asyncio.create_task(download_and_decode_abi_raw_contrib(bin_index, spec, blob)))
 
-            # GLM: schedule ALL blobs for this bin
             for blob in glm_blobs_in_bin[bin_index]:
                 tasks.append(asyncio.create_task(download_and_decode_glm_file_for_bin(bin_index, blob)))
 
         results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
 
+        # Consume results into raw accumulators (ABI) and glm sums
         for r in results:
             if isinstance(r, Exception) or not r:
                 continue
 
-            # ABI result tuple: (bin_index, short_key, ok, value, valid_fraction)
+            # ABI: (bin_index, short_key, ok, raw_sum, raw_count)
             if len(r) == 5 and r[1] in ("cmip", "acha", "tpw"):
-                bin_index, short_key, ok, value, valid_fraction = r
+                bin_index, short_key, ok, raw_sum, raw_count = r
                 if not (window_start <= bin_index < window_end):
                     continue
                 wi = bin_index - window_start
+                if ok and raw_sum is not None and raw_count is not None:
+                    s0, c0, k0 = raw_acc[short_key][wi]
+                    raw_acc[short_key][wi] = (s0 + raw_sum.astype(np.float32, copy=False),
+                                             c0 + raw_count.astype(np.int32, copy=False),
+                                             k0 + 1)
 
-                if ok and value is not None and valid_fraction is not None:
-                    w = valid_fraction.astype(np.float32, copy=False)
-                    v = np.nan_to_num(value.astype(np.float32, copy=False), nan=0.0)
+                    abi_present_win[wi, {"cmip": 0, "acha": 1, "tpw": 2}[short_key]] = np.uint8(1)
+                    abi_files_ok_window[wi, {"cmip": 0, "acha": 1, "tpw": 2}[short_key]] = np.int16(
+                        min(int(abi_files_ok_window[wi, {"cmip": 0, "acha": 1, "tpw": 2}[short_key]]) + 1, 32767)
+                    )
 
-                    if short_key == "cmip":
-                        cmip_present[wi] = np.uint8(1)
-                        cmip_vsum[wi] += v * w
-                        cmip_wsum[wi] += w
-                        cmip_vfsum[wi] += w
-                        cmip_ok[wi] = np.int16(min(int(cmip_ok[wi]) + 1, 32767))
-                        abi_files_ok_window[wi, 0] = np.int16(min(int(abi_files_ok_window[wi, 0]) + 1, 32767))
-
-                    elif short_key == "acha":
-                        acha_present[wi] = np.uint8(1)
-                        acha_vsum[wi] += v * w
-                        acha_wsum[wi] += w
-                        acha_vfsum[wi] += w
-                        acha_ok[wi] = np.int16(min(int(acha_ok[wi]) + 1, 32767))
-                        abi_files_ok_window[wi, 1] = np.int16(min(int(abi_files_ok_window[wi, 1]) + 1, 32767))
-
-                    else:  # tpw
-                        tpw_present[wi] = np.uint8(1)
-                        tpw_vsum[wi] += v * w
-                        tpw_wsum[wi] += w
-                        tpw_vfsum[wi] += w
-                        tpw_ok[wi] = np.int16(min(int(tpw_ok[wi]) + 1, 32767))
-                        abi_files_ok_window[wi, 2] = np.int16(min(int(abi_files_ok_window[wi, 2]) + 1, 32767))
-
-            # GLM result tuple: (bin_index, ok, counts)
+            # GLM: (bin_index, ok, counts)
             else:
                 bin_index, ok, counts = r
                 if not (window_start <= bin_index < window_end):
                     continue
                 wi = bin_index - window_start
                 if ok and counts is not None:
-                    glm_flash_count_sum[wi] += counts
+                    glm_flash_count_sum[wi] += counts.astype(np.float32, copy=False)
                     glm_bin_present[wi] = np.uint8(1)
                     glm_files_ok[wi] = np.int16(min(int(glm_files_ok[wi]) + 1, 32767))
 
-        # Finalize ABI arrays for this window
-        cmip_value, acha_value, tpw_value = [], [], []
-        cmip_vf,    acha_vf,    tpw_vf    = [], [], []
-
+        # Finalize ABI per bin by: raw_mean -> coarsen mean ignore NaN
         for wi in range(window_len):
-            v, vf = _finalize_abi_bin(cmip_vsum[wi], cmip_wsum[wi], cmip_vfsum[wi], int(cmip_ok[wi]))
-            cmip_value.append(v); cmip_vf.append(vf)
+            for p_idx, key in enumerate(("cmip", "acha", "tpw")):
+                raw_sum, raw_count, ok_files = raw_acc[key][wi]
 
-            v, vf = _finalize_abi_bin(acha_vsum[wi], acha_wsum[wi], acha_vfsum[wi], int(acha_ok[wi]))
-            acha_value.append(v); acha_vf.append(vf)
+                if ok_files <= 0:
+                    continue
 
-            v, vf = _finalize_abi_bin(tpw_vsum[wi], tpw_wsum[wi], tpw_vfsum[wi], int(tpw_ok[wi]))
-            tpw_value.append(v); tpw_vf.append(vf)
+                # raw per-pixel mean across files, ignoring invalid samples
+                raw_mean = np.full((raw_y, raw_x), np.nan, dtype=np.float32)
+                m = raw_count > 0
+                raw_mean[m] = (raw_sum[m] / raw_count[m]).astype(np.float32, copy=False)
 
-        # Build legacy X tensor
+                # coarsen once
+                coarse_val, coarse_vf = _coarsen_mean_ignore_nan(raw_mean, f)
+
+                # observed valid samples per coarse pixel = sum(raw_count) in block
+                coarse_valid_samples = _coarsen_sum_int(raw_count.astype(np.int32, copy=False), f).astype(np.int32, copy=False)
+
+                # observed total samples per coarse pixel = ok_files * (f*f) (constant across pixels)
+                coarse_total_samples = np.full((grid_y, grid_x), int(ok_files * (f * f)), dtype=np.int32)
+
+                # pad/crop in case shapes differ (should match by construction)
+                coarse_val = pad_or_crop_to_shape_2d(coarse_val.astype(np.float32, copy=False), grid_y, grid_x, fill=np.nan)
+                coarse_vf  = pad_or_crop_to_shape_2d(coarse_vf.astype(np.float32, copy=False),  grid_y, grid_x, fill=0.0)
+                coarse_valid_samples = pad_or_crop_to_shape_2d(coarse_valid_samples.astype(np.int32, copy=False), grid_y, grid_x, fill=0)
+                coarse_total_samples = pad_or_crop_to_shape_2d(coarse_total_samples.astype(np.int32, copy=False), grid_y, grid_x, fill=0)
+
+                abi_value_window[wi, p_idx] = coarse_val
+                abi_vf_window[wi, p_idx] = coarse_vf
+                abi_obs_valid_samples_win[wi, p_idx] = coarse_valid_samples
+                abi_obs_total_samples_win[wi, p_idx] = coarse_total_samples
+
+        # Legacy X tensor
         X_window = np.empty((window_len, NUM_FEATURE_CHANNELS, grid_y, grid_x), dtype=np.float32)
         for wi in range(window_len):
+            cmip = abi_value_window[wi, 0]
+            acha = abi_value_window[wi, 1]
+            tpw  = abi_value_window[wi, 2]
+            cmip_vf = abi_vf_window[wi, 0]
+            acha_vf = abi_vf_window[wi, 1]
+            tpw_vf  = abi_vf_window[wi, 2]
+
             X_window[wi] = np.stack(
                 [
-                    cmip_value[wi],
-                    acha_value[wi],
-                    tpw_value[wi],
+                    cmip,
+                    acha,
+                    tpw,
                     glm_flash_count_sum[wi],
-                    cmip_vf[wi],
-                    acha_vf[wi],
-                    tpw_vf[wi],
-                    ones_grid * np.float32(cmip_present[wi]),
-                    ones_grid * np.float32(acha_present[wi]),
-                    ones_grid * np.float32(tpw_present[wi]),
+                    cmip_vf,
+                    acha_vf,
+                    tpw_vf,
+                    ones_grid * np.float32(abi_present_win[wi, 0]),
+                    ones_grid * np.float32(abi_present_win[wi, 1]),
+                    ones_grid * np.float32(abi_present_win[wi, 2]),
                     ones_grid * np.float32(glm_bin_present[wi]),
                 ],
                 axis=0,
             )
-
-        abi_value_window = np.stack([cmip_value, acha_value, tpw_value], axis=1).astype(np.float32, copy=False)
-        abi_valid_fraction_window = np.stack([cmip_vf, acha_vf, tpw_vf], axis=1).astype(np.float32, copy=False)
-        abi_bin_present_window = np.stack([cmip_present, acha_present, tpw_present], axis=1).astype(np.uint8, copy=False)
-
-        glm_flash_count_window = np.stack(glm_flash_count_sum, axis=0).astype(np.float32, copy=False)
-        glm_bin_present_window = np.asarray(glm_bin_present, dtype=np.uint8)
 
         t_write0 = time.perf_counter()
         await asyncio.to_thread(
@@ -1345,21 +1288,23 @@ async def process_single_day(
             window_start,
             X_window,
             abi_value_window,
-            abi_valid_fraction_window,
-            abi_bin_present_window,
-            glm_flash_count_window,
-            glm_bin_present_window,
+            abi_vf_window,
+            abi_present_win,
+            glm_flash_count_sum,
+            glm_bin_present,
             glm_files_listed,
             glm_files_ok,
             abi_files_listed_window,
             abi_files_ok_window,
+            abi_expected_samples_win,
+            abi_obs_valid_samples_win,
+            abi_obs_total_samples_win,
         )
         write_seconds = time.perf_counter() - t_write0
         if write_seconds >= cfg.warn_if_write_slower_than_seconds:
             log(f"writer: WARNING slow write bins {window_start}:{window_end}  {write_seconds:.2f}s")
 
-        if window_start == 0 or (window_start // max(1, cfg.time_bin_write_window)) % 2 == 0:
-            log(f"{day_utc.date().isoformat()} wrote bins {window_start:03d}-{window_end-1:03d} / {n_bins-1:03d}")
+        log(f"{day_utc.date().isoformat()} wrote bins {window_start:03d}-{window_end-1:03d} / {n_bins-1:03d}")
 
     log(f"-> wrote merged: {out_zarr_path}  bins={n_bins}  grid={grid_y}x{grid_x}")
 
@@ -1388,7 +1333,6 @@ async def run_all_days():
     ensure_dir(cfg.output_root_dir)
     print_config()
 
-    # validate bin config early
     _ = bins_per_day()
     _ = bin_seconds()
 
@@ -1399,7 +1343,6 @@ async def run_all_days():
         limit=cfg.max_concurrent_http_requests,
         limit_per_host=cfg.tcp_limit_per_host,
         ttl_dns_cache=300,
-        enable_cleanup_closed=True,
     )
     http_semaphore = asyncio.Semaphore(cfg.max_concurrent_http_requests)
 
