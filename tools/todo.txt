@@ -1,5 +1,25 @@
-I want the following data per each individual ABI product's output pixel 
+I want the following data per each individual ABI product's output pixel
+
+expected pixels = expected pixels (expected input pixels per bin * corrison factor)
+
+valid pixels = pixels that are present and that do not have a bad DQF
+
+valid pixel fraction = valid pixles / expected input pixels (expected files per bin for ABI * corrison factor)
 
 
-valid pixles / expected input pixels (expected files per bin for ABI * corrison factor)
+I want this data for each individual ABI prodcuts bin 
 
+expected files = (expected ABI files per each bin * corrison factor)
+
+actual valid files downloaded = (actual valid files downloaded per bin * corrison factor)
+
+valid file fraction = expected files / actual valid files downloaded
+
+
+For GLM I want the following for each bin
+
+expected files = (expected glm files per each bin * corrison factor)
+
+actual valid files downloaded = (actual valid files downloaded per bin * corrison factor)
+
+valid file fraction = expected files / actual valid files downloaded
