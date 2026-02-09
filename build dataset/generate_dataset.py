@@ -2,26 +2,44 @@
 GOES ABI (CONUS L2) + GLM (LCFA) -> CONFIGURABLE bin aggregation (N x 5-min bins)
 ================================================================================
 
-ABI aggregation (UPDATED as requested):
+ABI aggregation (raw-stack mean, then coarsen ONCE):
 
 For each bin and ABI product:
   - On the native (raw) grid, stack all qualifying ABI files in that bin.
   - For each raw pixel:
-      simple mean across files, ignoring invalid samples (DQF!=0)
+      mean across files, ignoring invalid samples (DQF != 0)
       if no valid samples => NaN
   - Then coarsen ONCE by averaging the already-aggregated raw grid (ignore NaNs).
 
-We also output per-coarse-pixel sample accounting:
-  validation/abi_expected_input_samples[time_bin, abi_product, y, x]   int16/int32-ish
-  validation/abi_observed_valid_samples[time_bin, abi_product, y, x]   int16/int32-ish
-  validation/abi_observed_total_samples[time_bin, abi_product, y, x]   int16/int32-ish  (decoded_ok_files * f*f)
-
-valid_pixel_fraction definition (UPDATED):
-  = fraction of raw pixels in each coarsen block that are finite AFTER raw aggregation
-  = n_finite / (f*f)
-
-Strict bin assignment:
+STRICT bin assignment:
   file goes to bin k iff file_start >= bin_start AND file_end < bin_end
+
+Requested metrics (per your definitions)
+---------------------------------------
+
+ABI per-bin, per-product, per-output-pixel:
+  expected pixels = expected input pixels per bin * coarsen_factor^2
+    -> abi/expected_pixel_count[time_bin, abi_product, y, x] = expected_abi_files_per_bin * (f*f)
+
+  valid pixels = pixels present and not bad DQF
+    -> abi/valid_pixel_count[time_bin, abi_product, y, x] = sum(valid samples) within each fxf block across decoded files
+
+  valid pixel fraction = valid pixels / expected pixels
+    -> abi/valid_pixel_fraction = valid_pixel_count / expected_pixel_count
+
+ABI per-bin, per-product, file metrics (scaled by f*f as requested):
+  expected files = expected ABI files per bin * (f*f)
+  actual valid files downloaded = decoded_ok_files_in_bin * (f*f)
+  valid file fraction = expected / actual_valid   (NaN if actual_valid==0)
+
+GLM per-bin, file metrics (scaled by f*f as requested):
+  expected files = expected GLM files per bin * (f*f)
+  actual valid files downloaded = decoded_ok_glm_files_in_bin * (f*f)
+  valid file fraction = expected / actual_valid   (NaN if actual_valid==0)
+
+Also outputs:
+  glm/flash_count[time_bin,y,x]  float32  (sum of rasterized flash counts across GLM files in bin)
+  validation/*_files_listed_in_bin, *_files_decoded_ok_in_bin
 
 Deps:
   pip install aiohttp netCDF4 numpy zarr pyproj
@@ -64,9 +82,10 @@ class PipelineConfig:
     start_date_utc: str = "2025-10-16"
     end_date_utc: str = "2026-02-01"
 
+    # Each output "bin" is N*5min wide
     number_of_5min_bins_per_bin: int = 2
 
-    # coarsen factor f: block size fxf
+    # Coarsen factor f: output grid is raw grid aggregated in fxf blocks
     coarsen_factor: int | None = 4
 
     max_concurrent_http_requests: int = 32
@@ -137,9 +156,9 @@ FEATURE_CHANNEL_NAMES = np.array(
         "acha_ht",
         "tpw_tpw",
         "glm_flash_count",
-        "cmip_validfrac",
-        "acha_validfrac",
-        "tpw_validfrac",
+        "cmip_validpixfrac",
+        "acha_validpixfrac",
+        "tpw_validpixfrac",
         "cmip_present",
         "acha_present",
         "tpw_present",
@@ -418,7 +437,7 @@ async def download_gcs_object_bytes(session: aiohttp.ClientSession, blob_name: s
 # Array helpers
 # =============================================================================
 
-def pad_or_crop_to_shape_2d(a: np.ndarray, target_y: int, target_x: int, *, fill: float) -> np.ndarray:
+def pad_or_crop_to_shape_2d(a: np.ndarray, target_y: int, target_x: int, *, fill) -> np.ndarray:
     if a.shape == (target_y, target_x):
         return a
     out = np.full((target_y, target_x), fill, dtype=a.dtype)
@@ -510,7 +529,13 @@ def build_coarsened_scan_angle_vectors(x_raw: np.ndarray, y_raw: np.ndarray, f: 
 # ABI decode (raw) + per-bin reduce + coarsen
 # =============================================================================
 
-def _read_abi_raw_data_and_valid_mask(payload: bytes, data_variable: str, dqf_variable: str, reference_raw_y: int, reference_raw_x: int):
+def _read_abi_raw_data_and_valid_mask(
+    payload: bytes,
+    data_variable: str,
+    dqf_variable: str,
+    reference_raw_y: int,
+    reference_raw_x: int
+):
     """
     Returns (data_raw, valid_mask_raw) both shaped (reference_raw_y, reference_raw_x).
     valid_mask_raw True where DQF==0.
@@ -533,23 +558,19 @@ def _read_abi_raw_data_and_valid_mask(payload: bytes, data_variable: str, dqf_va
                 raise ValueError(f"{dqf_variable} shape {dqf.shape} != {data_variable} shape {data.shape}")
 
     data = pad_or_crop_to_shape_2d(data, reference_raw_y, reference_raw_x, fill=np.nan)
-    dqf  = pad_or_crop_to_shape_2d(dqf,  reference_raw_y, reference_raw_x, fill=1).astype(np.int16, copy=False)
+    dqf  = pad_or_crop_to_shape_2d(dqf,  reference_raw_y, reference_raw_x, fill=np.int16(1)).astype(np.int16, copy=False)
 
     valid = (dqf == 0)
     return data, valid
 
 
-def _coarsen_mean_ignore_nan(raw_mean: np.ndarray, f: int):
+def _coarsen_mean_ignore_nan(raw_mean: np.ndarray, f: int) -> np.ndarray:
     """
     raw_mean: (raw_y, raw_x) float32 with NaNs where invalid
-    returns:
-      coarse_value: (raw_y//f, raw_x//f) mean ignoring NaN
-      coarse_valid_pixel_fraction: fraction of raw pixels in block that are finite
+    returns coarse mean ignoring NaN (shape ~ raw_y//f, raw_x//f)
     """
     if f == 1:
-        finite = np.isfinite(raw_mean)
-        vf = finite.astype(np.float32)
-        return raw_mean.astype(np.float32, copy=False), vf
+        return raw_mean.astype(np.float32, copy=False)
 
     y2 = (raw_mean.shape[0] // f) * f
     x2 = (raw_mean.shape[1] // f) * f
@@ -564,14 +585,12 @@ def _coarsen_mean_ignore_nan(raw_mean: np.ndarray, f: int):
     denom = np.maximum(count, 1.0)
     mean = (s / denom).astype(np.float32, copy=False)
     mean = np.where(count > 0, mean, np.nan).astype(np.float32, copy=False)
-
-    vf = (count / float(f * f)).astype(np.float32, copy=False)
-    return mean, vf
+    return mean
 
 
-def _coarsen_sum_int(raw_count: np.ndarray, f: int):
+def _coarsen_sum_int(raw_count: np.ndarray, f: int) -> np.ndarray:
     """
-    raw_count: (raw_y, raw_x) int16/int32 counts per raw pixel
+    raw_count: (raw_y, raw_x) int32 counts per raw pixel
     returns coarse sum per block
     """
     if f == 1:
@@ -582,7 +601,13 @@ def _coarsen_sum_int(raw_count: np.ndarray, f: int):
     return a.reshape(y2 // f, f, x2 // f, f).sum(axis=(1, 3))
 
 
-def decode_abi_file_to_raw_contrib(payload: bytes, data_variable: str, dqf_variable: str, reference_raw_y: int, reference_raw_x: int):
+def decode_abi_file_to_raw_contrib(
+    payload: bytes,
+    data_variable: str,
+    dqf_variable: str,
+    reference_raw_y: int,
+    reference_raw_x: int
+):
     """
     Returns:
       raw_sum_valid: float32 (raw_y, raw_x)  (value where valid else 0)
@@ -607,7 +632,7 @@ def rasterize_glm_flash_counts_to_abi_grid(
     x_scan_angle_rad_coarse: np.ndarray,
     y_scan_angle_rad_coarse: np.ndarray,
     geos_projection: dict[str, float | str],
-):
+) -> np.ndarray:
     import netCDF4 as nc
     from pyproj import CRS, Transformer
 
@@ -724,7 +749,7 @@ def init_daily_zarr_store_atomic(
 
     root.attrs.update(
         {
-            "schema_version": "v4_raw_stack_mean_then_coarsen",
+            "schema_version": "v5_requested_pixel_and_file_metrics_cleanup",
             "year": year,
             "julian_day": julian_day,
             "coarsen_factor_effective": int(coarsen_factor),
@@ -734,8 +759,10 @@ def init_daily_zarr_store_atomic(
             "abi_bin_assignment_rule": "STRICT [t0,t1): file_start>=t0 and file_end<t1; include ALL qualifying files",
             "abi_aggregation_rule": "RAW grid mean across files ignoring DQF!=0; then coarsen mean ignoring NaN",
             "glm_bin_assignment_rule": "STRICT [t0,t1): file_start>=t0 and file_end<t1; include all qualifying files",
-            "missing_abi_behavior": "product_value=NaN, valid_pixel_fraction=0, bin_has_decoded_file=0",
-            "missing_glm_behavior": "flash_count=0, bin_has_decoded_file=0",
+            "expected_pixel_count_definition": "expected_abi_files_per_bin * (f*f)",
+            "valid_pixel_count_definition": "sum(valid samples) in each fxf block across decoded files",
+            "valid_pixel_fraction_definition": "valid_pixel_count / expected_pixel_count",
+            "valid_file_fraction_definition": "expected_files_scaled / actual_valid_files_scaled (NaN if actual==0)",
             "validation_expected_abi_files_per_5min": int(EXPECTED_ABI_FILES_PER_5MIN),
             "validation_expected_glm_files_per_5min": int(EXPECTED_GLM_FILES_PER_5MIN),
             "validation_expected_abi_files_per_bin": int(expected_abi_files_per_bin()),
@@ -760,6 +787,7 @@ def init_daily_zarr_store_atomic(
         }
     )
 
+    # axes
     root.create_dataset("features/channel_name", shape=(NUM_FEATURE_CHANNELS,), dtype="U32", chunks=(NUM_FEATURE_CHANNELS,), overwrite=True)[:] = FEATURE_CHANNEL_NAMES
 
     root.create_dataset("time/bin_start_ns", shape=(n_bins,), chunks=(min(n_bins, 1024),), dtype="i8", overwrite=True)[:] = (
@@ -776,6 +804,7 @@ def init_daily_zarr_store_atomic(
     root.create_dataset("grid/x_scan_angle_rad", shape=(grid_x,), chunks=(min(grid_x, 4096),), dtype="f8", overwrite=True)
     root.create_dataset("grid/y_scan_angle_rad", shape=(grid_y,), chunks=(min(grid_y, 4096),), dtype="f8", overwrite=True)
 
+    # legacy tensor
     root.create_dataset(
         "features/X",
         shape=(n_bins, NUM_FEATURE_CHANNELS, grid_y, grid_x),
@@ -786,6 +815,7 @@ def init_daily_zarr_store_atomic(
         compressor=compressor,
     )
 
+    # ABI outputs
     root.create_dataset(
         "abi/product_value",
         shape=(n_bins, NUM_ABI_PRODUCTS, grid_y, grid_x),
@@ -793,6 +823,24 @@ def init_daily_zarr_store_atomic(
         dtype="f4",
         overwrite=True,
         fill_value=np.nan,
+        compressor=compressor,
+    )
+    root.create_dataset(
+        "abi/expected_pixel_count",
+        shape=(n_bins, NUM_ABI_PRODUCTS, grid_y, grid_x),
+        chunks=(min(cfg.zarr_time_chunk, n_bins), 1, cfg.zarr_chunk_y, cfg.zarr_chunk_x),
+        dtype="i4",
+        overwrite=True,
+        fill_value=0,
+        compressor=compressor,
+    )
+    root.create_dataset(
+        "abi/valid_pixel_count",
+        shape=(n_bins, NUM_ABI_PRODUCTS, grid_y, grid_x),
+        chunks=(min(cfg.zarr_time_chunk, n_bins), 1, cfg.zarr_chunk_y, cfg.zarr_chunk_x),
+        dtype="i4",
+        overwrite=True,
+        fill_value=0,
         compressor=compressor,
     )
     root.create_dataset(
@@ -814,36 +862,7 @@ def init_daily_zarr_store_atomic(
         compressor=compressor,
     )
 
-    # NEW: per-coarse-pixel sample accounting
-    # Use int32 to avoid overflow for large windows/files (safer than int16).
-    root.create_dataset(
-        "validation/abi_expected_input_samples",
-        shape=(n_bins, NUM_ABI_PRODUCTS, grid_y, grid_x),
-        chunks=(min(cfg.zarr_time_chunk, n_bins), 1, cfg.zarr_chunk_y, cfg.zarr_chunk_x),
-        dtype="i4",
-        overwrite=True,
-        fill_value=0,
-        compressor=compressor,
-    )
-    root.create_dataset(
-        "validation/abi_observed_valid_samples",
-        shape=(n_bins, NUM_ABI_PRODUCTS, grid_y, grid_x),
-        chunks=(min(cfg.zarr_time_chunk, n_bins), 1, cfg.zarr_chunk_y, cfg.zarr_chunk_x),
-        dtype="i4",
-        overwrite=True,
-        fill_value=0,
-        compressor=compressor,
-    )
-    root.create_dataset(
-        "validation/abi_observed_total_samples",
-        shape=(n_bins, NUM_ABI_PRODUCTS, grid_y, grid_x),
-        chunks=(min(cfg.zarr_time_chunk, n_bins), 1, cfg.zarr_chunk_y, cfg.zarr_chunk_x),
-        dtype="i4",
-        overwrite=True,
-        fill_value=0,
-        compressor=compressor,
-    )
-
+    # GLM outputs
     root.create_dataset(
         "glm/flash_count",
         shape=(n_bins, grid_y, grid_x),
@@ -862,34 +881,8 @@ def init_daily_zarr_store_atomic(
         fill_value=0,
         compressor=compressor,
     )
-    root.create_dataset(
-        "glm/files_listed_in_bin",
-        shape=(n_bins,),
-        chunks=(n_bins,),
-        dtype="i2",
-        overwrite=True,
-        fill_value=0,
-        compressor=compressor,
-    )
-    root.create_dataset(
-        "glm/files_decoded_ok_in_bin",
-        shape=(n_bins,),
-        chunks=(n_bins,),
-        dtype="i2",
-        overwrite=True,
-        fill_value=0,
-        compressor=compressor,
-    )
 
-    root.create_dataset(
-        "validation/abi_expected_files_per_bin",
-        shape=(n_bins, NUM_ABI_PRODUCTS),
-        chunks=(n_bins, NUM_ABI_PRODUCTS),
-        dtype="i2",
-        overwrite=True,
-        fill_value=np.int16(expected_abi_files_per_bin()),
-        compressor=compressor,
-    )
+    # Validation listed/ok counts
     root.create_dataset(
         "validation/abi_files_listed_in_bin",
         shape=(n_bins, NUM_ABI_PRODUCTS),
@@ -906,16 +899,6 @@ def init_daily_zarr_store_atomic(
         dtype="i2",
         overwrite=True,
         fill_value=0,
-        compressor=compressor,
-    )
-
-    root.create_dataset(
-        "validation/glm_expected_files_per_bin",
-        shape=(n_bins,),
-        chunks=(n_bins,),
-        dtype="i2",
-        overwrite=True,
-        fill_value=np.int16(expected_glm_files_per_bin()),
         compressor=compressor,
     )
     root.create_dataset(
@@ -937,6 +920,64 @@ def init_daily_zarr_store_atomic(
         compressor=compressor,
     )
 
+    # Requested scaled file metrics
+    root.create_dataset(
+        "validation/abi_expected_files_scaled",
+        shape=(n_bins, NUM_ABI_PRODUCTS),
+        chunks=(n_bins, NUM_ABI_PRODUCTS),
+        dtype="f4",
+        overwrite=True,
+        fill_value=0.0,
+        compressor=compressor,
+    )
+    root.create_dataset(
+        "validation/abi_actual_valid_files_scaled",
+        shape=(n_bins, NUM_ABI_PRODUCTS),
+        chunks=(n_bins, NUM_ABI_PRODUCTS),
+        dtype="f4",
+        overwrite=True,
+        fill_value=0.0,
+        compressor=compressor,
+    )
+    root.create_dataset(
+        "validation/abi_valid_file_fraction",
+        shape=(n_bins, NUM_ABI_PRODUCTS),
+        chunks=(n_bins, NUM_ABI_PRODUCTS),
+        dtype="f4",
+        overwrite=True,
+        fill_value=np.nan,
+        compressor=compressor,
+    )
+
+    root.create_dataset(
+        "validation/glm_expected_files_scaled",
+        shape=(n_bins,),
+        chunks=(n_bins,),
+        dtype="f4",
+        overwrite=True,
+        fill_value=0.0,
+        compressor=compressor,
+    )
+    root.create_dataset(
+        "validation/glm_actual_valid_files_scaled",
+        shape=(n_bins,),
+        chunks=(n_bins,),
+        dtype="f4",
+        overwrite=True,
+        fill_value=0.0,
+        compressor=compressor,
+    )
+    root.create_dataset(
+        "validation/glm_valid_file_fraction",
+        shape=(n_bins,),
+        chunks=(n_bins,),
+        dtype="f4",
+        overwrite=True,
+        fill_value=np.nan,
+        compressor=compressor,
+    )
+
+    # Atomic move
     if os.path.isdir(out_zarr_path):
         remove_directory_tree(out_zarr_path)
     shutil.move(tmp_path, out_zarr_path)
@@ -948,7 +989,9 @@ def _write_time_window_to_zarr(
     window_start_bin: int,
     X_window: np.ndarray,
     abi_value_window: np.ndarray,
-    abi_valid_fraction_window: np.ndarray,
+    abi_expected_pixel_count_window: np.ndarray,
+    abi_valid_pixel_count_window: np.ndarray,
+    abi_valid_pixel_fraction_window: np.ndarray,
     abi_bin_present_window: np.ndarray,
     glm_flash_count_window: np.ndarray,
     glm_bin_present_window: np.ndarray,
@@ -956,32 +999,38 @@ def _write_time_window_to_zarr(
     glm_files_ok_window: np.ndarray,
     abi_files_listed_window: np.ndarray,
     abi_files_ok_window: np.ndarray,
-    abi_expected_samples_window: np.ndarray,
-    abi_observed_valid_samples_window: np.ndarray,
-    abi_observed_total_samples_window: np.ndarray,
+    abi_expected_files_scaled_window: np.ndarray,
+    abi_actual_valid_files_scaled_window: np.ndarray,
+    abi_valid_file_fraction_window: np.ndarray,
+    glm_expected_files_scaled_window: np.ndarray,
+    glm_actual_valid_files_scaled_window: np.ndarray,
+    glm_valid_file_fraction_window: np.ndarray,
 ):
     window_end_bin = window_start_bin + X_window.shape[0]
 
     root["features/X"][window_start_bin:window_end_bin, :, :, :] = X_window
 
     root["abi/product_value"][window_start_bin:window_end_bin, :, :, :] = abi_value_window
-    root["abi/valid_pixel_fraction"][window_start_bin:window_end_bin, :, :, :] = abi_valid_fraction_window
+    root["abi/expected_pixel_count"][window_start_bin:window_end_bin, :, :, :] = abi_expected_pixel_count_window
+    root["abi/valid_pixel_count"][window_start_bin:window_end_bin, :, :, :] = abi_valid_pixel_count_window
+    root["abi/valid_pixel_fraction"][window_start_bin:window_end_bin, :, :, :] = abi_valid_pixel_fraction_window
     root["abi/bin_has_decoded_file"][window_start_bin:window_end_bin, :] = abi_bin_present_window
 
     root["glm/flash_count"][window_start_bin:window_end_bin, :, :] = glm_flash_count_window
     root["glm/bin_has_decoded_file"][window_start_bin:window_end_bin] = glm_bin_present_window
-    root["glm/files_listed_in_bin"][window_start_bin:window_end_bin] = glm_files_listed_window
-    root["glm/files_decoded_ok_in_bin"][window_start_bin:window_end_bin] = glm_files_ok_window
 
     root["validation/glm_files_listed_in_bin"][window_start_bin:window_end_bin] = glm_files_listed_window
     root["validation/glm_files_decoded_ok_in_bin"][window_start_bin:window_end_bin] = glm_files_ok_window
-
     root["validation/abi_files_listed_in_bin"][window_start_bin:window_end_bin, :] = abi_files_listed_window
     root["validation/abi_files_decoded_ok_in_bin"][window_start_bin:window_end_bin, :] = abi_files_ok_window
 
-    root["validation/abi_expected_input_samples"][window_start_bin:window_end_bin, :, :, :] = abi_expected_samples_window
-    root["validation/abi_observed_valid_samples"][window_start_bin:window_end_bin, :, :, :] = abi_observed_valid_samples_window
-    root["validation/abi_observed_total_samples"][window_start_bin:window_end_bin, :, :, :] = abi_observed_total_samples_window
+    root["validation/abi_expected_files_scaled"][window_start_bin:window_end_bin, :] = abi_expected_files_scaled_window
+    root["validation/abi_actual_valid_files_scaled"][window_start_bin:window_end_bin, :] = abi_actual_valid_files_scaled_window
+    root["validation/abi_valid_file_fraction"][window_start_bin:window_end_bin, :] = abi_valid_file_fraction_window
+
+    root["validation/glm_expected_files_scaled"][window_start_bin:window_end_bin] = glm_expected_files_scaled_window
+    root["validation/glm_actual_valid_files_scaled"][window_start_bin:window_end_bin] = glm_actual_valid_files_scaled_window
+    root["validation/glm_valid_file_fraction"][window_start_bin:window_end_bin] = glm_valid_file_fraction_window
 
 
 # =============================================================================
@@ -1036,11 +1085,11 @@ async def process_single_day(
     glm_blobs_in_bin = group_files_into_bins_strict(day_start, glm_triples) if glm_triples else [[] for _ in range(n_bins)]
     glm_listed_counts = np.array([min(len(x), 32767) for x in glm_blobs_in_bin], dtype=np.int16)
 
-    # Probe reference ABI
+    # Probe reference ABI (to determine grid)
     log("probing ABI reference...")
     probe_payload = None
-    probe_spec = None
-    probe_blob = None
+    probe_spec: RemoteProductSpec | None = None
+    probe_blob: str | None = None
 
     for spec in ABI_PRODUCT_SPECS:
         for bin_list in abi_blobs_in_bin_by_product[spec.short_key]:
@@ -1125,56 +1174,77 @@ async def process_single_day(
             return (bin_index, False, None)
 
         try:
-            counts = await loop.run_in_executor(decode_pool, _decode_glm_worker, payload, x_scan_angle_rad, y_scan_angle_rad, geos_projection)
+            counts = await loop.run_in_executor(
+                decode_pool,
+                _decode_glm_worker,
+                payload,
+                x_scan_angle_rad,
+                y_scan_angle_rad,
+                geos_projection,
+            )
             return (bin_index, True, counts)
         except Exception:
             return (bin_index, False, None)
 
     ones_grid = np.ones((grid_y, grid_x), dtype=np.float32)
-    expected_samples_per_output_pixel = int(expected_abi_files_per_bin() * (f * f))
+
+    pix_mult = float(f * f)
+
+    expected_pix_per_output_pixel = int(expected_abi_files_per_bin() * (f * f))
+
+    expected_abi_files_scaled = float(expected_abi_files_per_bin()) * pix_mult
+    expected_glm_files_scaled = float(expected_glm_files_per_bin()) * pix_mult
+
+    prod_index = {"cmip": 0, "acha": 1, "tpw": 2}
 
     for window_start in range(0, n_bins, cfg.time_bin_write_window):
         window_end = min(n_bins, window_start + cfg.time_bin_write_window)
         window_len = window_end - window_start
 
-        # Per-window outputs (coarse)
+        # ABI window arrays
         abi_value_window = np.full((window_len, NUM_ABI_PRODUCTS, grid_y, grid_x), np.nan, dtype=np.float32)
-        abi_vf_window    = np.zeros((window_len, NUM_ABI_PRODUCTS, grid_y, grid_x), dtype=np.float32)
-        abi_present_win  = np.zeros((window_len, NUM_ABI_PRODUCTS), dtype=np.uint8)
+        abi_expected_pix_window = np.zeros((window_len, NUM_ABI_PRODUCTS, grid_y, grid_x), dtype=np.int32)
+        abi_valid_pix_window    = np.zeros((window_len, NUM_ABI_PRODUCTS, grid_y, grid_x), dtype=np.int32)
+        abi_vpf_window          = np.zeros((window_len, NUM_ABI_PRODUCTS, grid_y, grid_x), dtype=np.float32)
+        abi_present_win         = np.zeros((window_len, NUM_ABI_PRODUCTS), dtype=np.uint8)
 
-        abi_expected_samples_win = np.zeros((window_len, NUM_ABI_PRODUCTS, grid_y, grid_x), dtype=np.int32)
-        abi_obs_valid_samples_win = np.zeros((window_len, NUM_ABI_PRODUCTS, grid_y, grid_x), dtype=np.int32)
-        abi_obs_total_samples_win = np.zeros((window_len, NUM_ABI_PRODUCTS, grid_y, grid_x), dtype=np.int32)
-
-        # GLM window
+        # GLM window arrays
         glm_flash_count_sum = np.zeros((window_len, grid_y, grid_x), dtype=np.float32)
         glm_bin_present = np.zeros((window_len,), dtype=np.uint8)
+
+        # Validation (listed/ok counts)
         glm_files_listed = np.zeros((window_len,), dtype=np.int16)
         glm_files_ok = np.zeros((window_len,), dtype=np.int16)
-
-        # Validation per-bin counts
         abi_files_listed_window = np.zeros((window_len, NUM_ABI_PRODUCTS), dtype=np.int16)
         abi_files_ok_window = np.zeros((window_len, NUM_ABI_PRODUCTS), dtype=np.int16)
 
-        # Raw accumulators for ABI in this window, per product, per bin
-        # Store as dict: (wi -> (raw_sum, raw_count, ok_files))
+        # Requested scaled file metrics
+        abi_expected_files_scaled_win = np.full((window_len, NUM_ABI_PRODUCTS), np.float32(expected_abi_files_scaled), dtype=np.float32)
+        abi_actual_valid_files_scaled_win = np.zeros((window_len, NUM_ABI_PRODUCTS), dtype=np.float32)
+        abi_valid_file_fraction_win = np.full((window_len, NUM_ABI_PRODUCTS), np.nan, dtype=np.float32)
+
+        glm_expected_files_scaled_win = np.full((window_len,), np.float32(expected_glm_files_scaled), dtype=np.float32)
+        glm_actual_valid_files_scaled_win = np.zeros((window_len,), dtype=np.float32)
+        glm_valid_file_fraction_win = np.full((window_len,), np.nan, dtype=np.float32)
+
+        # Raw accumulators for ABI: per product, per bin
+        # (raw_sum float32, raw_count int32, ok_files int)
         raw_acc = {
             "cmip": [(np.zeros((raw_y, raw_x), dtype=np.float32), np.zeros((raw_y, raw_x), dtype=np.int32), 0) for _ in range(window_len)],
             "acha": [(np.zeros((raw_y, raw_x), dtype=np.float32), np.zeros((raw_y, raw_x), dtype=np.int32), 0) for _ in range(window_len)],
             "tpw":  [(np.zeros((raw_y, raw_x), dtype=np.float32), np.zeros((raw_y, raw_x), dtype=np.int32), 0) for _ in range(window_len)],
         }
 
+        # Fill constant expected pixels and listed counts
         for bin_index in range(window_start, window_end):
             wi = bin_index - window_start
 
             glm_files_listed[wi] = glm_listed_counts[bin_index]
 
-            abi_files_listed_window[wi, 0] = np.int16(min(len(abi_blobs_in_bin_by_product["cmip"][bin_index]), 32767))
-            abi_files_listed_window[wi, 1] = np.int16(min(len(abi_blobs_in_bin_by_product["acha"][bin_index]), 32767))
-            abi_files_listed_window[wi, 2] = np.int16(min(len(abi_blobs_in_bin_by_product["tpw"][bin_index]), 32767))
+            for key, pidx in prod_index.items():
+                abi_files_listed_window[wi, pidx] = np.int16(min(len(abi_blobs_in_bin_by_product[key][bin_index]), 32767))
 
-            # expected input samples per output pixel (constant given config)
-            abi_expected_samples_win[wi, :, :, :] = expected_samples_per_output_pixel
+            abi_expected_pix_window[wi, :, :, :] = np.int32(expected_pix_per_output_pixel)
 
         # Schedule downloads/decodes
         tasks: list[asyncio.Task] = []
@@ -1188,27 +1258,27 @@ async def process_single_day(
 
         results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
 
-        # Consume results into raw accumulators (ABI) and glm sums
+        # Consume results into ABI raw accumulators and GLM sums
         for r in results:
             if isinstance(r, Exception) or not r:
                 continue
 
             # ABI: (bin_index, short_key, ok, raw_sum, raw_count)
-            if len(r) == 5 and r[1] in ("cmip", "acha", "tpw"):
+            if len(r) == 5 and r[1] in prod_index:
                 bin_index, short_key, ok, raw_sum, raw_count = r
                 if not (window_start <= bin_index < window_end):
                     continue
                 wi = bin_index - window_start
                 if ok and raw_sum is not None and raw_count is not None:
                     s0, c0, k0 = raw_acc[short_key][wi]
-                    raw_acc[short_key][wi] = (s0 + raw_sum.astype(np.float32, copy=False),
-                                             c0 + raw_count.astype(np.int32, copy=False),
-                                             k0 + 1)
-
-                    abi_present_win[wi, {"cmip": 0, "acha": 1, "tpw": 2}[short_key]] = np.uint8(1)
-                    abi_files_ok_window[wi, {"cmip": 0, "acha": 1, "tpw": 2}[short_key]] = np.int16(
-                        min(int(abi_files_ok_window[wi, {"cmip": 0, "acha": 1, "tpw": 2}[short_key]]) + 1, 32767)
+                    raw_acc[short_key][wi] = (
+                        s0 + raw_sum.astype(np.float32, copy=False),
+                        c0 + raw_count.astype(np.int32, copy=False),
+                        k0 + 1,
                     )
+                    pidx = prod_index[short_key]
+                    abi_present_win[wi, pidx] = np.uint8(1)
+                    abi_files_ok_window[wi, pidx] = np.int16(min(int(abi_files_ok_window[wi, pidx]) + 1, 32767))
 
             # GLM: (bin_index, ok, counts)
             else:
@@ -1221,48 +1291,52 @@ async def process_single_day(
                     glm_bin_present[wi] = np.uint8(1)
                     glm_files_ok[wi] = np.int16(min(int(glm_files_ok[wi]) + 1, 32767))
 
-        # Finalize ABI per bin by: raw_mean -> coarsen mean ignore NaN
-        for wi in range(window_len):
-            for p_idx, key in enumerate(("cmip", "acha", "tpw")):
-                raw_sum, raw_count, ok_files = raw_acc[key][wi]
+        # Compute requested scaled file metrics
+        abi_actual_valid_files_scaled_win[:, :] = abi_files_ok_window.astype(np.float32) * np.float32(pix_mult)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            abi_valid_file_fraction_win[:, :] = (
+                abi_expected_files_scaled_win / np.where(abi_actual_valid_files_scaled_win > 0, abi_actual_valid_files_scaled_win, np.nan)
+            ).astype(np.float32)
 
+        glm_actual_valid_files_scaled_win[:] = glm_files_ok.astype(np.float32) * np.float32(pix_mult)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            glm_valid_file_fraction_win[:] = (
+                glm_expected_files_scaled_win / np.where(glm_actual_valid_files_scaled_win > 0, glm_actual_valid_files_scaled_win, np.nan)
+            ).astype(np.float32)
+
+        # Finalize ABI per bin: raw_mean -> coarsen once, valid counts -> coarsen sum
+        for wi in range(window_len):
+            for key, p_idx in prod_index.items():
+                raw_sum, raw_count, ok_files = raw_acc[key][wi]
                 if ok_files <= 0:
                     continue
 
-                # raw per-pixel mean across files, ignoring invalid samples
                 raw_mean = np.full((raw_y, raw_x), np.nan, dtype=np.float32)
                 m = raw_count > 0
                 raw_mean[m] = (raw_sum[m] / raw_count[m]).astype(np.float32, copy=False)
 
-                # coarsen once
-                coarse_val, coarse_vf = _coarsen_mean_ignore_nan(raw_mean, f)
-
-                # observed valid samples per coarse pixel = sum(raw_count) in block
+                coarse_val = _coarsen_mean_ignore_nan(raw_mean, f)
                 coarse_valid_samples = _coarsen_sum_int(raw_count.astype(np.int32, copy=False), f).astype(np.int32, copy=False)
 
-                # observed total samples per coarse pixel = ok_files * (f*f) (constant across pixels)
-                coarse_total_samples = np.full((grid_y, grid_x), int(ok_files * (f * f)), dtype=np.int32)
-
-                # pad/crop in case shapes differ (should match by construction)
                 coarse_val = pad_or_crop_to_shape_2d(coarse_val.astype(np.float32, copy=False), grid_y, grid_x, fill=np.nan)
-                coarse_vf  = pad_or_crop_to_shape_2d(coarse_vf.astype(np.float32, copy=False),  grid_y, grid_x, fill=0.0)
-                coarse_valid_samples = pad_or_crop_to_shape_2d(coarse_valid_samples.astype(np.int32, copy=False), grid_y, grid_x, fill=0)
-                coarse_total_samples = pad_or_crop_to_shape_2d(coarse_total_samples.astype(np.int32, copy=False), grid_y, grid_x, fill=0)
+                coarse_valid_samples = pad_or_crop_to_shape_2d(coarse_valid_samples.astype(np.int32, copy=False), grid_y, grid_x, fill=np.int32(0))
 
                 abi_value_window[wi, p_idx] = coarse_val
-                abi_vf_window[wi, p_idx] = coarse_vf
-                abi_obs_valid_samples_win[wi, p_idx] = coarse_valid_samples
-                abi_obs_total_samples_win[wi, p_idx] = coarse_total_samples
+                abi_valid_pix_window[wi, p_idx] = coarse_valid_samples
 
-        # Legacy X tensor
+                denom = float(expected_pix_per_output_pixel)
+                abi_vpf_window[wi, p_idx] = (coarse_valid_samples.astype(np.float32, copy=False) / denom).astype(np.float32, copy=False)
+
+        # Legacy X tensor uses valid_pixel_fraction per your updated definition
         X_window = np.empty((window_len, NUM_FEATURE_CHANNELS, grid_y, grid_x), dtype=np.float32)
         for wi in range(window_len):
             cmip = abi_value_window[wi, 0]
             acha = abi_value_window[wi, 1]
             tpw  = abi_value_window[wi, 2]
-            cmip_vf = abi_vf_window[wi, 0]
-            acha_vf = abi_vf_window[wi, 1]
-            tpw_vf  = abi_vf_window[wi, 2]
+
+            cmip_vpf = abi_vpf_window[wi, 0]
+            acha_vpf = abi_vpf_window[wi, 1]
+            tpw_vpf  = abi_vpf_window[wi, 2]
 
             X_window[wi] = np.stack(
                 [
@@ -1270,9 +1344,9 @@ async def process_single_day(
                     acha,
                     tpw,
                     glm_flash_count_sum[wi],
-                    cmip_vf,
-                    acha_vf,
-                    tpw_vf,
+                    cmip_vpf,
+                    acha_vpf,
+                    tpw_vpf,
                     ones_grid * np.float32(abi_present_win[wi, 0]),
                     ones_grid * np.float32(abi_present_win[wi, 1]),
                     ones_grid * np.float32(abi_present_win[wi, 2]),
@@ -1288,7 +1362,9 @@ async def process_single_day(
             window_start,
             X_window,
             abi_value_window,
-            abi_vf_window,
+            abi_expected_pix_window,
+            abi_valid_pix_window,
+            abi_vpf_window,
             abi_present_win,
             glm_flash_count_sum,
             glm_bin_present,
@@ -1296,9 +1372,12 @@ async def process_single_day(
             glm_files_ok,
             abi_files_listed_window,
             abi_files_ok_window,
-            abi_expected_samples_win,
-            abi_obs_valid_samples_win,
-            abi_obs_total_samples_win,
+            abi_expected_files_scaled_win,
+            abi_actual_valid_files_scaled_win,
+            abi_valid_file_fraction_win,
+            glm_expected_files_scaled_win,
+            glm_actual_valid_files_scaled_win,
+            glm_valid_file_fraction_win,
         )
         write_seconds = time.perf_counter() - t_write0
         if write_seconds >= cfg.warn_if_write_slower_than_seconds:
